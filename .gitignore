@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Python compiled bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Logs & temp files
+*.log
+console_cmd.txt
+
+# Local app data & caches
+.system_generated/

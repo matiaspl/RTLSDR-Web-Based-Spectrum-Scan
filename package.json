@@ -1,0 +1,10 @@
+{
+  "name": "shure-ad600-node-app",
+  "version": "1.0.0",
+  "description": "Cross-platform Node.js Auto-Discovery & Real-Time Spectrum GUI for Shure AD600 Spectrum Manager",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
