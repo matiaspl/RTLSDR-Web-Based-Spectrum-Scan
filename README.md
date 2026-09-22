@@ -6,11 +6,22 @@ A modern, high-performance web dashboard for real-time RF spectrum analysis, ant
 
 ---
 
+## Why This Project Exists
+
+In standard production workflows, connecting to the Shure AD600 with Wireless Workbench (WWB) limits the live spectrum view to a single computer and a single operator.
+
+This application was built to break through that single-screen bottleneck and unlock **collaborative RF workflows** across production teams:
+* **Simultaneous Multi-User Access**: Any number of engineers, technicians, and coordinators can open the live spectrum plot at the same time on their own screens over the local network.
+* **Multi-Device Support**: Responsive web layout optimized for **iPads, tablets, smartphones, and laptops**, allowing team members to carry live spectrum monitoring directly to the stage, backstage, or venue perimeter during walk-tests and rehearsals.
+* **Zero Client Installation**: Team members simply open a web browser on their device to monitor real-time sweeps and antenna status without needing to install desktop software.
+
+---
+
 ## Overview
 
 The Shure AD600 is an industry-standard wideband RF scanner covering **174 MHz to 2.0 GHz**. This application communicates directly with the AD600 over your local network, managing real-time device control, automated frequency configuration, and continuous streaming spectrum telemetry.
 
-It serves an interactive, low-latency dashboard accessible from any web browser on your computer or mobile device (such as an **iPad** for walk-testing and stage monitoring).
+It serves an interactive, low-latency dashboard accessible from any web browser on your computer or mobile device.
 
 ---
 
