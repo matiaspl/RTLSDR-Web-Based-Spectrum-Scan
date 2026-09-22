@@ -92,7 +92,7 @@ function getNetworkInterfaces() {
 }
 
 // 2. 1.8 Engine Process Manager & Multi-Antenna Trace Aggregator
-const { spawn, exec, execSync } = require('child_process');
+const { spawn, exec, execSync, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -121,7 +121,6 @@ let antennaTraces = {
 };
 
 let engineProcess = null;
-let restartTimer = null;
 
 let udpDiscoverySocket = null;
 
@@ -198,8 +197,8 @@ function runDiscovery18(targetIface = null) {
     : (appState.interfaces.length ? appState.interfaces.map(i => i.name) : ['en6']);
 
   ifacesToProbe.forEach(iface => {
-    const cmd = `"${DISCOVER_BIN}" "${iface}"`;
-    exec(cmd, { cwd: SCANNER_DIR, timeout: 12000 }, (err, stdout, stderr) => {
+    // execFile (not exec) so `iface` is passed as a literal argv entry, never interpreted by a shell.
+    execFile(DISCOVER_BIN, [iface], { cwd: SCANNER_DIR, timeout: 12000 }, (err, stdout, stderr) => {
       if (err) return;
       const out = (stdout || '').trim();
       if (out) {
@@ -232,10 +231,15 @@ let bridgePollInterval = null;
 function start18EngineScan() {
   if (engineProcess) return;
 
+  // Best-effort cleanup of orphaned engine processes left behind by a prior Node process
+  // lifetime (e.g. this server crashed without going through stop18EngineScan). Scoped to this
+  // installation's own absolute script paths rather than bare filenames, so it can't match an
+  // unrelated process that happens to share a script name.
   try {
-    const { execSync } = require('child_process');
-    execSync('pkill -15 -f ad600_console.py 2>/dev/null || true');
-    execSync('pkill -15 -f ad600_bridge_launch.py 2>/dev/null || true');
+    const consolePyPath = path.join(__dirname, 'engine', 'ad600_console.py');
+    const bootstrapPyPath = path.join(os.tmpdir(), 'ad600_bridge_launch.py');
+    execSync(`pkill -15 -f "${consolePyPath}" 2>/dev/null || true`);
+    execSync(`pkill -15 -f "${bootstrapPyPath}" 2>/dev/null || true`);
   } catch (e) {}
 
   const targetIp = appState.activeTargetIp || '169.254.244.206';
@@ -265,13 +269,11 @@ function start18EngineScan() {
     AD600_ENGINE_DIR: engineDir,
     AD600_CLIENT_DIR: engineDir,
     AD600_CONSOLE_PY: path.join(engineDir, 'ad600_console.py'),
-    AD600_ENGINE_BIN: path.join(engineDir, 'nonexistent_bin'),
     AD600_REACTIVE_FEED: 'BUILTIN',
     AD600_ENGINE_SCRATCH: scratchDir,
     AD600_RT_COMPRESSION: String(appState.rbwComp || '14'),
     AD600_CURVE_SELECT: String(computeCurveMask(appState.selectedAntennas)),
     AD600_REPEAT: appState.scanMode === 'SINGLE' ? '1' : '255',
-    AD600_SCANID_REWRITE: '1',
     AD600_REACTIVE_ACK: '1',
     AD600_DROP_SPURIOUS: '1',
     AD600_ARM_ON_STATUS: '1',
@@ -289,15 +291,41 @@ function start18EngineScan() {
     fs.writeFileSync(path.join(scratchDir, 'console_cmd.txt'), '');
   } catch (e) {}
 
-  // Write the Python bootstrap script to a temp file so __file__ is set correctly
-  const tmpScript = path.join(require('os').tmpdir(), 'ad600_bridge_launch.py');
+  // Runtime values (interface name, discovered device CID, MAC, etc.) are passed to the
+  // bootstrap script via a JSON file rather than interpolated into Python source: JSON.stringify
+  // properly escapes them, so nothing here can break out of a Python string literal — unlike the
+  // old approach, which let an unvalidated interface name become arbitrary injected Python.
+  const bridgeConfigPath = path.join(os.tmpdir(), 'ad600_bridge_config.json');
+  const bridgeConfig = {
+    iface: { name: selectedNic, ipv4: nicIp, mac: nicMac },
+    device: { device_ip: targetIp, device_cid: devCid, device_port: 57383 },
+    startHz: Math.round((appState.startFreqMhz || 470.0) * 1e6),
+    stopHz: Math.round((appState.endFreqMhz || 608.0) * 1e6),
+    rbwHz: appState.rbwHz || 350000,
+    curveMask: computeCurveMask(appState.selectedAntennas),
+    repeat: appState.scanMode === 'SINGLE' ? 1 : 255,
+    startSweep: appState.scanState === 'SCANNING'
+  };
+  try {
+    fs.writeFileSync(bridgeConfigPath, JSON.stringify(bridgeConfig));
+  } catch (e) {
+    console.log('[RF ENGINE] Failed to write bridge config JSON:', e.message);
+  }
+
+  // Write the Python bootstrap script to a temp file so __file__ is set correctly. The only
+  // JS values interpolated below are Node-controlled filesystem paths (JSON.stringify-escaped),
+  // never user- or network-supplied data.
+  const tmpScript = path.join(os.tmpdir(), 'ad600_bridge_launch.py');
   const pyCode = `
-import os, sys, time, signal, atexit
-sys.path.insert(0, '${engineDir}')
+import os, sys, time, signal, atexit, json
+sys.path.insert(0, ${JSON.stringify(engineDir)})
 import ad600_bridge, ad600_engine, ad600_discovery
 
-iface = {'name': '${selectedNic}', 'ipv4': '${nicIp}', 'mac': '${nicMac}'}
-dev = {'device_ip': '${targetIp}', 'device_cid': '${devCid}', 'device_port': 57383}
+with open(${JSON.stringify(bridgeConfigPath)}, 'r', encoding='utf-8') as _cf:
+    _cfg = json.load(_cf)
+
+iface = _cfg['iface']
+dev = _cfg['device']
 
 mac = iface.get('mac')
 if not mac or mac.startswith('02:00') or mac.startswith('00:00'):
@@ -316,23 +344,26 @@ br.on_config_change = eng.apply_config
 # Apply configuration
 try:
     br.apply_configuration({
-        'startHz': ${Math.round((appState.startFreqMhz || 470.0) * 1e6)},
-        'stopHz': ${Math.round((appState.endFreqMhz || 608.0) * 1e6)},
-        'rbwHz': ${appState.rbwHz || 350000},
-        'curveMask': ${computeCurveMask(appState.selectedAntennas)},
-        'repeat': ${appState.scanMode === 'SINGLE' ? 1 : 255}
+        'startHz': _cfg['startHz'],
+        'stopHz': _cfg['stopHz'],
+        'rbwHz': _cfg['rbwHz'],
+        'curveMask': _cfg['curveMask'],
+        'repeat': _cfg['repeat']
     })
 except Exception as e:
     sys.stderr.write('CONFIG ERR: ' + str(e) + '\\n')
 
 def _cleanup(*args):
+    # eng.stop() runs the graceful QUIT-FIRST teardown (releases the scan slot) before any hard
+    # kill. Killing eng.proc first (as this used to do) skipped that teardown and could leave the
+    # device's slot-0 lease stale until a power-cycle.
     try:
-        if hasattr(eng, 'proc') and eng.proc:
-            eng.proc.kill()
+        eng.stop()
     except Exception:
         pass
     try:
-        eng.stop()
+        if hasattr(eng, 'proc') and eng.proc and eng.proc.poll() is None:
+            eng.proc.kill()
     except Exception:
         pass
 
@@ -343,7 +374,7 @@ signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
 eng.start(dev, iface, our_cid)
 
 # Start sweeping if scanState is SCANNING
-if ${appState.scanState === 'SCANNING' ? 'True' : 'False'}:
+if _cfg.get('startSweep'):
     br.sweep_start()
 
 sys.stdout.write('PYTHON RF BRIDGE ENGINE RUNNING ON PORT 8088\\n')
@@ -358,14 +389,21 @@ while True:
         sys.stdout.flush()
 `;
 
-  require('fs').writeFileSync(tmpScript, pyCode);
-  engineProcess = spawn(pythonBin, [tmpScript], { env });
+  fs.writeFileSync(tmpScript, pyCode);
+  const proc = spawn(pythonBin, [tmpScript], { env });
+  engineProcess = proc;
 
-  engineProcess.stdout.on('data', d => {
-    const text = d.toString('utf8');
+  let stdoutBuffer = '';
+  proc.stdout.on('data', d => {
+    if (engineProcess !== proc) return; // a newer engine process has already taken over
+    stdoutBuffer += d.toString('utf8');
+    const completeLines = stdoutBuffer.split('\n');
+    stdoutBuffer = completeLines.pop(); // keep the trailing partial line for the next chunk
+    if (completeLines.length === 0) return;
+    const text = completeLines.join('\n') + '\n';
     console.log('[1.8 ENGINE STDOUT]', text.trim());
 
-    if (text.includes('CONNECTED') || text.includes('OWNERSHIP CLAIMED') || text.includes('ACCESS-LEVEL') || text.includes('SCAN READY') || text.includes('SCAN-OWNERSHIP')) {
+    if (text.includes('CONNECTED') || text.includes('OWNERSHIP CLAIMED') || text.includes('ACCESS-LEVEL') || text.includes('SCAN-READY') || text.includes('SCAN-OWNERSHIP')) {
       if (appState.connectionState !== 'CONNECTED') {
         appState.connectionState = 'CONNECTED';
         if (appState.scanState === 'SCANNING') {
@@ -381,8 +419,7 @@ while True:
       appState.status = 'AD600 CONNECTION REFUSED - SLOT TAKEN (TRY POWER-CYCLING AD600)';
     }
 
-    const lines = text.split('\n');
-    for (const l of lines) {
+    for (const l of completeLines) {
       const match = l.match(/^BIAS\s+([A-F])\s+([01])/i);
       if (match) {
         const ant = match[1].toUpperCase();
@@ -405,10 +442,14 @@ while True:
     }
   });
 
-  engineProcess.stderr.on('data', d => console.log('[1.8 ENGINE STDERR]', d.toString('utf8').trim()));
+  proc.stderr.on('data', d => {
+    if (engineProcess !== proc) return;
+    console.log('[1.8 ENGINE STDERR]', d.toString('utf8').trim());
+  });
 
-  engineProcess.on('exit', (code) => {
+  proc.on('exit', (code) => {
     console.log(`[1.8 ENGINE] Process exited with code ${code}`);
+    if (engineProcess !== proc) return; // a newer engine process already replaced this one
     engineProcess = null;
     appState.connectionState = 'DISCONNECTED';
     appState.temperature = null;
@@ -580,70 +621,54 @@ function startBridgePolling() {
 
 function stop18EngineScan() {
   lastProcessedSweepId = -1;
-  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
   if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
   appState.temperature = null;
   if (engineProcess) {
+    // SIGTERM is caught inside the Python bootstrap and triggers its atexit cleanup, which runs
+    // eng.stop()'s graceful QUIT-FIRST teardown (releases the scan slot) before the process exits.
+    // No separate pkill needed here — the old one matched any process system-wide by bare script
+    // name rather than just this app's own child.
     try { engineProcess.kill('SIGTERM'); } catch (e) {}
     engineProcess = null;
   }
-  try {
-    const { execSync } = require('child_process');
-    execSync('pkill -15 -f ad600_bridge_launch.py 2>/dev/null || true');
-    execSync('pkill -15 -f ad600_console.py 2>/dev/null || true');
-  } catch (e) {}
-}
-
-function parseLogChunk(text) {
-  const lines = text.split('\n');
-  lines.forEach(line => {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('FRAME ')) {
-      const parts = trimmed.split(/\s+/);
-      if (parts.length >= 5) {
-        const antIdx = parseInt(parts[1], 10);
-        const floKhz = parseInt(parts[2], 10);
-        const fhiKhz = parseInt(parts[3], 10);
-        const b64 = parts[4];
-
-        const antKeys = ['A', 'B', 'C', 'D', 'E', 'F'];
-        const antKey = antKeys[antIdx] || 'A';
-
-        try {
-          const buf = Buffer.from(b64, 'base64');
-          const pointCount = Math.floor(buf.length / 2);
-          if (pointCount > 0) {
-            const START_FREQ = 470000; // 470 MHz in kHz
-            const END_FREQ = 1000000; // 1.0 GHz in kHz
-            const STEP_KHZ = (END_FREQ - START_FREQ) / 212;
-
-            for (let i = 0; i < pointCount; i++) {
-              const rawInt = buf.readInt16BE(i * 2);
-              const dbm = rawInt / 10.0;
-              const freqKhz = floKhz + (i * (fhiKhz - floKhz) / Math.max(1, pointCount - 1));
-
-              if (freqKhz >= START_FREQ && freqKhz <= END_FREQ) {
-                const binIdx = Math.round((freqKhz - START_FREQ) / STEP_KHZ);
-                if (binIdx >= 0 && binIdx < 213) {
-                  antennaTraces[antKey][binIdx] = Math.round(dbm * 10) / 10;
-                }
-              }
-            }
-
-            appState.scansCaptured += 1;
-            appState.lastScanTime = Date.now();
-            appState.status = `SCANNING AD600 HARDWARE - REAL LIVE SPECTRUM DECODE (${pointCount} Pts)`;
-          }
-        } catch (err) {
-          console.error('[FRAME DECODE ERROR]', err.message);
-        }
-      }
-    }
-  });
 }
 
 function initAcnSpectrumIngest() {
   runDiscovery18();
+}
+
+// Shared frequency-band <optgroup> markup for the display-zoom selector and every per-antenna /
+// per-pair range selector, so the preset list only has to be edited in one place.
+function bandOptionsHtml(selectedValue, customLabel) {
+  customLabel = customLabel || 'Custom...';
+  const sel = v => (v === selectedValue ? ' selected' : '');
+  return `
+            <optgroup label="Shure Bands">
+              <option value="G57"${sel('G57')}>G57: 470 – 608 MHz</option>
+              <option value="G57_PLUS"${sel('G57_PLUS')}>G57+: 470 – 616 MHz</option>
+              <option value="G10"${sel('G10')}>G10: 470 – 542 MHz</option>
+              <option value="H22"${sel('H22')}>H22: 518 – 584 MHz</option>
+              <option value="J8"${sel('J8')}>J8: 626 – 664 MHz</option>
+              <option value="J8A"${sel('J8A')}>J8A: 554 – 616 MHz</option>
+              <option value="K54"${sel('K54')}>K54: 608 – 663 MHz</option>
+              <option value="X55"${sel('X55')}>X55: 940 – 960 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser Bands">
+              <option value="A1_A4"${sel('A1_A4')}>A1-A4: 470 – 558 MHz</option>
+              <option value="A5_A8"${sel('A5_A8')}>A5-A8: 550 – 608 MHz</option>
+            </optgroup>
+            <optgroup label="Frequency Spans">
+              <option value="VHF"${sel('VHF')}>VHF: 174 – 216 MHz</option>
+              <option value="470_524"${sel('470_524')}>Low UHF: 470 – 524 MHz</option>
+              <option value="524_620"${sel('524_620')}>Mid UHF: 524 – 620 MHz</option>
+              <option value="608_1000"${sel('608_1000')}>Upper: 608 – 1000 MHz</option>
+              <option value="AFTRCC"${sel('AFTRCC')}>AFTRCC: 1435 – 1525 MHz</option>
+              <option value="470_1000"${sel('470_1000')}>470 – 1000 MHz (1 GHz)</option>
+              <option value="470_2000"${sel('470_2000')}>470 – 2000 MHz (2 GHz)</option>
+              <option value="174_1000"${sel('174_1000')}>174 – 1000 MHz (1 GHz)</option>
+              <option value="FULL_SPAN"${sel('FULL_SPAN')}>Full Span: 174 – 2000 MHz (2 GHz)</option>
+              <option value="CUSTOM"${sel('CUSTOM')}>${customLabel}</option>
+            </optgroup>`;
 }
 
 // 3. Web UI HTML Dashboard Template
@@ -1398,32 +1423,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         <div style="display: flex; gap: 8px; align-items: center;">
           <select id="displayZoomSelect" onchange="onDisplayZoomSelect(this.value)">
             <option value="LOCKED" selected>Auto-Fit Active Antennas</option>
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom Display Span...</option>
-            </optgroup>
+            ${bandOptionsHtml('', 'Custom Display Span...')}
           </select>
           <button id="lockZoomBtn" class="btn-lock active" onclick="toggleLockZoom()" title="Lock display zoom to match active antenna ranges">
             Lock Zoom
@@ -1444,8 +1444,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       <div class="control-group">
         <label class="control-label">RBW / Resolution</label>
         <select id="rbwSelect" onchange="onRbwSelect(this.value)">
-          <option value="25000">25 kHz (Ultra High Res · comp 1)</option>
-          <option value="50000">50 kHz (Very High Res · comp 2)</option>
+          <option value="50000">50 kHz (Ultra High Res · comp 2)</option>
           <option value="100000">100 kHz (High Res · comp 4)</option>
           <option value="350000" selected>350 kHz (Standard · comp 14)</option>
           <option value="900000">900 kHz (Fast Scan · comp 36)</option>
@@ -1495,32 +1494,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_AB" onchange="onPairRangePreset('AB', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524" selected>Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('470_524')}
           </select>
           <div id="antCustom_AB" class="antenna-custom-inputs">
             <input type="number" id="customStart_AB" step="0.5" value="470.0" onchange="onPairCustomInput('AB')" oninput="onPairCustomInput('AB')">
@@ -1548,32 +1522,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_A" onchange="onAntennaRangePreset('A', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524" selected>Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('470_524')}
           </select>
           <div id="antCustom_A" class="antenna-custom-inputs">
             <input type="number" id="customStart_A" step="0.5" value="470.0" onchange="onAntennaCustomInput('A')" oninput="onAntennaCustomInput('A')">
@@ -1601,32 +1550,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_B" onchange="onAntennaRangePreset('B', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620" selected>Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('524_620')}
           </select>
           <div id="antCustom_B" class="antenna-custom-inputs">
             <input type="number" id="customStart_B" step="0.5" value="524.0" onchange="onAntennaCustomInput('B')" oninput="onAntennaCustomInput('B')">
@@ -1651,32 +1575,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_CD" onchange="onPairRangePreset('CD', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10" selected>G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('G10')}
           </select>
           <div id="antCustom_CD" class="antenna-custom-inputs">
             <input type="number" id="customStart_CD" step="0.5" value="470.0" onchange="onPairCustomInput('CD')" oninput="onPairCustomInput('CD')">
@@ -1704,32 +1603,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_C" onchange="onAntennaRangePreset('C', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10" selected>G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('G10')}
           </select>
           <div id="antCustom_C" class="antenna-custom-inputs">
             <input type="number" id="customStart_C" step="0.5" value="470.0" onchange="onAntennaCustomInput('C')" oninput="onAntennaCustomInput('C')">
@@ -1757,32 +1631,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_D" onchange="onAntennaRangePreset('D', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22" selected>H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('H22')}
           </select>
           <div id="antCustom_D" class="antenna-custom-inputs">
             <input type="number" id="customStart_D" step="0.5" value="518.0" onchange="onAntennaCustomInput('D')" oninput="onAntennaCustomInput('D')">
@@ -1807,32 +1656,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_EF" onchange="onPairRangePreset('EF', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A" selected>J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('J8A')}
           </select>
           <div id="antCustom_EF" class="antenna-custom-inputs">
             <input type="number" id="customStart_EF" step="0.5" value="554.0" onchange="onPairCustomInput('EF')" oninput="onPairCustomInput('EF')">
@@ -1860,32 +1684,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_E" onchange="onAntennaRangePreset('E', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A" selected>J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000">470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('J8A')}
           </select>
           <div id="antCustom_E" class="antenna-custom-inputs">
             <input type="number" id="customStart_E" step="0.5" value="554.0" onchange="onAntennaCustomInput('E')" oninput="onAntennaCustomInput('E')">
@@ -1913,32 +1712,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_F" onchange="onAntennaRangePreset('F', this.value)">
-            <optgroup label="Shure Bands">
-              <option value="G57">G57: 470 – 608 MHz</option>
-              <option value="G57_PLUS">G57+: 470 – 616 MHz</option>
-              <option value="G10">G10: 470 – 542 MHz</option>
-              <option value="H22">H22: 518 – 584 MHz</option>
-              <option value="J8">J8: 626 – 664 MHz</option>
-              <option value="J8A">J8A: 554 – 616 MHz</option>
-              <option value="K54">K54: 608 – 663 MHz</option>
-              <option value="X55">X55: 940 – 960 MHz</option>
-            </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4">A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8">A5-A8: 550 – 608 MHz</option>
-            </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF">VHF: 174 – 216 MHz</option>
-              <option value="470_524">Low UHF: 470 – 524 MHz</option>
-              <option value="524_620">Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000">Upper: 608 – 1000 MHz</option>
-              <option value="AFTRCC">AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000" selected>470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000">470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000">174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN">Full Span: 174 – 2000 MHz (2 GHz)</option>
-              <option value="CUSTOM">Custom...</option>
-            </optgroup>
+            ${bandOptionsHtml('470_1000')}
           </select>
           <div id="antCustom_F" class="antenna-custom-inputs">
             <input type="number" id="customStart_F" step="0.5" value="470.0" onchange="onAntennaCustomInput('F')" oninput="onAntennaCustomInput('F')">
@@ -1994,14 +1768,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   <script>
     let chart = null;
     let isScanning = false;
-    const ANT_COLORS = {
-      'A': '#00ffaa',
-      'B': '#00b0ff',
-      'C': '#ffaa00',
-      'D': '#ff4455',
-      'E': '#cc00ff',
-      'F': '#ffff00'
-    };
+    const ANT_COLORS = ${JSON.stringify(ANT_COLORS)}; // generated from the server's single source of truth
 
     // DTV Station Overlay State & Frequency Calculations
     let dtvStandard = 'US'; // 'US' (6 MHz) | 'UK' (8 MHz)
@@ -3685,10 +3452,13 @@ function startWebServer() {
         try {
           const payload = JSON.parse(body);
           const rbw = parseInt(payload.rbwHz, 10);
-          const VALID_RBWS = [25000, 50000, 100000, 350000, 900000];
+          // 25 kHz (comp 1) is excluded: verified live to reproducibly return corrupted
+          // amplitudes (a decode bug in ad600_native.py's RF_SCAN_DATA parser, not a hardware
+          // limit) — 50 kHz is the lowest RBW confirmed to stream clean data.
+          const VALID_RBWS = [50000, 100000, 350000, 900000];
           if (VALID_RBWS.includes(rbw)) {
             appState.rbwHz = rbw;
-            appState.rbwComp = Math.max(1, Math.round(rbw / 25000));
+            appState.rbwComp = Math.max(2, Math.round(rbw / 25000));
             appState.sweepConfigSeq = (appState.sweepConfigSeq || 0) + 1;
             console.log(`[RBW CONFIG] Set RBW to ${appState.rbwHz} Hz (comp ${appState.rbwComp}, seq=${appState.sweepConfigSeq})`);
 
@@ -3798,10 +3568,21 @@ function startWebServer() {
         try {
           const payload = JSON.parse(body);
           if (payload.interface) {
-            appState.selectedInterface = payload.interface;
-            appState.status = `PROBING INTERFACE ${payload.interface}...`;
-            console.log(`[NIC SELECTION] User selected interface ${payload.interface}`);
-            runDiscovery18(payload.interface);
+            const requested = String(payload.interface);
+            getNetworkInterfaces();
+            // Only accept a name that's actually a real NIC on this machine (or 'ALL') — this
+            // value is later passed to the Python bootstrap and to a discovery subprocess call,
+            // so it must never be arbitrary client-supplied text.
+            const isValidIface = requested === 'ALL' || appState.interfaces.some(nic => nic.name === requested);
+            if (!isValidIface) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Unknown network interface' }));
+              return;
+            }
+            appState.selectedInterface = requested;
+            appState.status = `PROBING INTERFACE ${requested}...`;
+            console.log(`[NIC SELECTION] User selected interface ${requested}`);
+            runDiscovery18(requested);
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, selectedInterface: appState.selectedInterface }));

@@ -344,30 +344,38 @@ class _SessionBase:
                 self._drain_commands(time.time())
                 continue
 
+            if _addr[0] != DEV_IP:
+                continue   # ignore anything not from our claimed device (other hosts on the LAN)
+
             if len(data) > 200:
                 self.big_pkts += 1
                 if self.big_pkts <= 3 or self.big_pkts % 50 == 0:
                     print("  ★★★ %6.2fs BIG PACKET #%d len=%d — STREAM DATA"
                           % (time.time() - self.t0, self.big_pkts, len(data)))
 
-            pr = root_parse(data)
-            if not pr:
-                continue
-            _src, sdt = pr
+            # A truncated/garbled datagram can throw deep inside PDU/DMP decode (struct.unpack,
+            # slicing) — catch it here so one bad packet can't kill the whole session/process.
+            try:
+                pr = root_parse(data)
+                if not pr:
+                    continue
+                _src, sdt = pr
 
-            off = 0
-            while off < len(sdt):
-                r = pdu_decode(sdt, off)
-                if not r:
-                    break
-                _f, ds, end = r
-                vec = sdt[ds]
-                vdata = sdt[ds + 1:end]
-                off = end
-                self._dispatch(vec, vdata, time.time())
+                off = 0
+                while off < len(sdt):
+                    r = pdu_decode(sdt, off)
+                    if not r:
+                        break
+                    _f, ds, end = r
+                    vec = sdt[ds]
+                    vdata = sdt[ds + 1:end]
+                    off = end
+                    self._dispatch(vec, vdata, time.time())
 
-            if self.accepted_us and self.sent_accept and self.dev_chan and not self.joined:
-                self._complete_join()
+                if self.accepted_us and self.sent_accept and self.dev_chan and not self.joined:
+                    self._complete_join()
+            except Exception as e:
+                print("  [packet decode/dispatch error: %r len=%d]" % (e, len(data)))
 
             self._drain_commands(time.time())
 

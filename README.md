@@ -19,7 +19,6 @@ It serves an interactive, low-latency dashboard accessible from any web browser 
 ### Real-Time RF Spectrum Analysis
 * **High-Speed Hardware Sweeping**: Continuously samples and plots live RF energy (dBm) with fast frame rates.
 * **Selectable Resolution Bandwidth (RBW)**:
-  * `25 kHz` (Ultra-High Resolution)
   * `50 kHz` (Very High Resolution)
   * `100 kHz` (High Resolution)
   * `350 kHz` (Standard Fast Sweep)

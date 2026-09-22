@@ -350,8 +350,11 @@ class Engine:
         os.makedirs(SCRATCH, exist_ok=True)
         cmd_file = self._cmd_file = os.path.join(SCRATCH, "console_cmd.txt")
         log_file = os.path.join(SCRATCH, "console_out.log")
-        # the console loads the feed via one control line, then owner-claim drives the arm
-        with open(cmd_file, "w") as f:
+        # the console loads the feed via one control line, then owner-claim drives the arm.
+        # Shared with Bridge's /bias handler, which appends to this same file from the HTTP
+        # thread — take its lock so a truncate here can't land mid-append and lose a command.
+        cmdfile_lock = getattr(self.bridge, "cmdfile_lock", None)
+        with (cmdfile_lock or threading.Lock()), open(cmd_file, "w") as f:
             f.write("lockfeed %s\n" % (self.feed or "BUILTIN"))
         rt_comp = self._requested_rt_comp()
         start_khz, stop_khz = self._requested_range()

@@ -31,16 +31,21 @@ FREQ_BASE_KHZ = 174000            # freq_idx 0 == 174.000 MHz
 IDX_KHZ       = 25                # 25 kHz per freq_idx step  (freq_MHz = 174 + idx*0.025)
 FLOOR_DBM     = -130.0            # amplitude floor for grid points with no sample
 
-# ── delivered RBW = REAL_TIME_COMPRESSION * 25 kHz (verified live: comp 36→900kHz, comp 14→350kHz) ──
+# ── delivered RBW = REAL_TIME_COMPRESSION * 25 kHz ──
 # Standard RBW reference set so the user picks from standard analyzer values. Whatever they
 # pick, rbw_hz_to_comp maps it to the nearest RBW the AD600 can actually STREAM — clamped to the
-# validated [350k,900k] band (comp 14..36) — and the POST /configuration response echoes the EFFECTIVE
-# value (the clamp-and-echo model). 350 kHz (comp 14) is the finest confirmed streamable; the device
-# SET_FAILs below 25 kHz outright, and comp<14 is unproven. Narrow the scan range (startHz/stopHz)
-# to afford a finer RBW cheaply.
-RBW_COMP_MIN  = 1                 # 25 kHz (1 * 25 kHz) — native hardware quantization floor
+# validated range — and the POST /configuration response echoes the EFFECTIVE value (the
+# clamp-and-echo model).
+#
+# Verified live against a real AD600 (2026-09, cross-checked against desktop testing):
+# comp 2 (50 kHz) through comp 36 (900 kHz) stream clean, sane amplitudes. comp 1
+# (25 kHz) reproducibly returns CORRUPTED amplitudes (physically impossible dBm values) — the
+# RF_SCAN_DATA frame layout at that compression isn't the one parse_rf_scan_data (ad600_native.py)
+# assumes, and needs an actual packet capture at comp=1 to fix correctly. So 50 kHz, not 25 kHz,
+# is the real floor until that decode is fixed.
+RBW_COMP_MIN  = 2                 # 50 kHz — comp 1 (25 kHz) is known to corrupt amplitudes; see above
 RBW_COMP_MAX  = 36                # 900 kHz — feed default (coarsest)
-SUPPORTED_RBW_HZ = [25000, 50000, 100000, 350000, 900000]
+SUPPORTED_RBW_HZ = [50000, 100000, 350000, 900000]
 
 
 def rbw_hz_to_comp(rbw_hz):
@@ -171,6 +176,9 @@ class Bridge:
         self._cv = threading.Condition(self._lock)
         self._httpd = None
         self._http_thread = None
+        # Guards console_cmd.txt, which this process's /bias handler (appends) and the engine's
+        # _run_once() (truncates on every arm/re-arm) both write to from different threads.
+        self.cmdfile_lock = threading.Lock()
 
         # live stats (menubar)
         self.frames_total = 0
@@ -263,8 +271,9 @@ class Bridge:
             self._publish()
             self.cycle.clear()
             if self.scan_config.get("repeat") == 1:
-                with self._lock:
-                    self.sweeping = False
+                # Caller (feed()) already holds self._lock via self._cv — self._lock is a plain
+                # (non-reentrant) Lock, so re-acquiring it here would deadlock this thread forever.
+                self.sweeping = False
         self.cycle.add(ant)
 
     def _clean(self, arr):
@@ -592,7 +601,9 @@ class Bridge:
                     cmd_dir = os.environ.get("AD600_ENGINE_SCRATCH") or os.path.join(os.path.expanduser("~"), ".ad600_scanner")
                     try:
                         os.makedirs(cmd_dir, exist_ok=True)
-                        with open(os.path.join(cmd_dir, "console_cmd.txt"), "a") as f:
+                        # Shared with Engine._run_once(), which truncates this same file on every
+                        # (re)arm — without this lock a bias command written mid-truncate is lost.
+                        with bridge.cmdfile_lock, open(os.path.join(cmd_dir, "console_cmd.txt"), "a") as f:
                             f.write("set 0107047%d %s\n" % (idx, "01" if enabled else "00"))
                         return self._json(200, {"antenna": ant, "enabled": enabled, "status": "ok"})
                     except Exception as e:

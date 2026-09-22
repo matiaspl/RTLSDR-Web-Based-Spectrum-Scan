@@ -321,6 +321,7 @@ def pdu_decode(b, i):
     if i+2 > len(b): return None
     f = b[i] >> 4
     if f & 0x8:
+        if i+3 > len(b): return None
         ln = ((b[i]&0x0f)<<16)|(b[i+1]<<8)|b[i+2]; ds = i+3
     else:
         ln = ((b[i]&0x0f)<<8)|b[i+1]; ds = i+2
