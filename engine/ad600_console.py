@@ -295,13 +295,23 @@ class _SessionBase:
             pos = self.rx_pos
             dec = aes_ctr_at(self.key, nonce, pos, ct)
             if not _valid_dmp_head(dec, len(ct)):
-                fp, fdec = find_ctr_pos(self.key, nonce, ct, self.rx_pos)
-                if fdec is not None:
-                    pos, dec = fp, fdec
-            if dec and _valid_dmp_head(dec, len(ct)):
+                # The wrapper states its own CTR block counter (payload[12:20]); try that exact
+                # position before any search — our running rx_pos drifts whenever a device block
+                # is lost or reordered. (Ported from the SoundBase plugin's console.)
+                stated_pos = struct.unpack(">Q", payload[12:20])[0] * 16
+                d_stated = aes_ctr_at(self.key, nonce, stated_pos, ct)
+                if _valid_dmp_head(d_stated, len(ct), allow_continuation=True):
+                    pos, dec = stated_pos, d_stated
+                else:
+                    fp, fdec = find_ctr_pos(self.key, nonce, ct, stated_pos)
+                    if fdec is None and stated_pos != self.rx_pos:
+                        fp, fdec = find_ctr_pos(self.key, nonce, ct, self.rx_pos)
+                    if fdec is not None:
+                        pos, dec = fp, fdec
+            if dec and _valid_dmp_head(dec, len(ct), allow_continuation=True):
                 self.rx_seen[ct] = pos
                 self.rx_pos = max(self.rx_pos, pos + len(ct))
-        if dec and (_valid_dmp_head(dec, len(ct)) or dec[0] == 0x70):
+        if dec and (_valid_dmp_head(dec, len(ct), allow_continuation=True) or dec[0] == 0x70):
             self.decoded += 1
             return dec
         self.undec += 1
@@ -946,22 +956,6 @@ class Ad600Console(WwbMirror):
                 sys.stdout.write("BIAS %s %d\n" % (ant_letter, 1 if is_on else 0))
                 sys.stdout.flush()
 
-        # HARDWARE TEMPERATURE TELEMETRY
-        if addr in (0x0100007b, 0x010c0010, 0x01010104) and len(value) >= 1:
-            raw_temp = int.from_bytes(value, "big")
-            celsius = None
-            if 250 <= raw_temp <= 400:
-                celsius = raw_temp - 273.15
-            elif 2500 <= raw_temp <= 4000:
-                celsius = (raw_temp / 10.0) - 273.15
-            elif 15 <= raw_temp <= 90:
-                celsius = float(raw_temp)
-            if celsius is not None:
-                print("  %6.2fs  ★ TEMPERATURE TELEMETRY = %.1f°C (addr=0x%08x)"
-                      % (time.time() - self.t0, celsius, addr))
-                sys.stdout.write("TEMP %.1f\n" % celsius)
-                sys.stdout.flush()
-
         # ACCESS-LEVEL probe: 0x01201106=access-level name (WWB reads "Admin"), plus
         # 0x01201102/1103/1003.
         if vector == 3 and addr in (0x01201106, 0x01201102, 0x01201103, 0x01201003):
@@ -982,8 +976,6 @@ class Ad600Console(WwbMirror):
             for _i in range(6):
                 self._send_block(dmp_pdu(DMP_GET, 0x01070470 + _i))
                 self._send_block(dmp_pdu(DMP_SUBSCRIBE, 0x01070470 + _i))
-            for _taddr in (0x0100007b, 0x010c0010, 0x01010104):
-                self._send_block(dmp_pdu(DMP_GET, _taddr))
 
         # NON-OWNER signal: GET_FAIL (vector 9) on the ownership address.
         if vector == 9 and addr == 0x0107010f:
@@ -1011,7 +1003,9 @@ class Ad600Console(WwbMirror):
     # the socket-timeout branch and after each received datagram). We repurpose it to service the
     # control file and flush any DMP queued before the association came up.
     def _drain_commands(self, now):
-        # On first connection milestone (proto_ok), query hardware bias and temp immediately
+        # On first connection milestone (proto_ok), query + subscribe to antenna bias. Bias changes
+        # then arrive as EVENTs, so no periodic polling is needed. (There is no known temperature
+        # property: 0x0100007b / 0x010c0010 / 0x01010104 were checked live and none holds one.)
         if self.proto_ok and not getattr(self, "_connect_polled", False):
             self._connect_polled = True
             print("  %6.2fs  ★ CONNECTED TO AD600 (DMP READY) — Querying Bias for Ports A-F" % (now - self.t0))
@@ -1020,8 +1014,6 @@ class Ad600Console(WwbMirror):
             for _i in range(6):
                 self._send_block(dmp_pdu(DMP_GET, 0x01070470 + _i))
                 self._send_block(dmp_pdu(DMP_SUBSCRIBE, 0x01070470 + _i))
-            for _taddr in (0x0100007b, 0x010c0010, 0x01010104):
-                self._send_block(dmp_pdu(DMP_GET, _taddr))
 
         # flush sends queued before DMP was enabled
         if self.proto_ok and self.pending:

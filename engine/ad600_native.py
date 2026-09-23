@@ -100,7 +100,7 @@ def _ks(key, nonce8, need):
             ent+=aes_encrypt_block(sched, nonce8+(bi&((1<<64)-1)).to_bytes(8,"big")); bi+=1
     return ent
 _DMP_VECS = frozenset((1,2,3,4,5,6,7,9,10,12,13))   # GET/SET/SUB + all reply/event/accept vectors
-def _valid_dmp_head(pt, exact_len=None):
+def _valid_dmp_head(pt, exact_len=None, allow_continuation=False):
     """True if `pt` begins with a well-formed DMP PDU.
 
     The ACN 2-byte-length PDU is [0x70|hi, lo][vector][addr-hdr][addr/name...]; so the
@@ -111,6 +111,16 @@ def _valid_dmp_head(pt, exact_len=None):
     `exact_len` (=len(ct)) lets us reject any candidate whose declared PDU length overruns the
     decrypted block, killing false positives during the drift-recovery window search."""
     if not pt: return False
+    if allow_continuation and (pt[0] >> 4) in (0x1, 0x3, 0x5, 0x9, 0xb, 0xd):
+        # A continuation PDU (no vector flag) inherits vector + header from the previous block;
+        # the device sends these for large RF_SCAN_DATA events. Only accepted when the caller
+        # already has a strong position (the packet's stated CTR offset), never in the window
+        # search, and only if it decodes to scan data. (Ported from the SoundBase plugin.)
+        r = pdu_decode(pt, 0)
+        if not r: return False
+        f, ds, end = r
+        if exact_len is not None and end > exact_len: return False
+        return (not (f & 0x4)) and b"RF_SCAN" in pt
     if (pt[0] >> 4) not in (0x7, 0xf): return False          # ACN PDU flags nibble
     r = pdu_decode(pt, 0)
     if not r: return False
@@ -258,8 +268,8 @@ _SRP_N_1024 = int(
  "9ccc041c7bc308d82a5698f3a8d0c38271ae35f8e9dbfbb694b5c803d89f7ae435de236d525f5475"
  "9b65e372fcd68ef20fa7111f9e4aff73", 16)
 _SRP_g = 2
-_SRP_I = os.environ.get("AD600_SRP_USER","USER_LEVEL0").encode()   # SRP identity (try 'wwb' from FTP)
-_SRP_P = os.environ.get("AD600_SRP_PASS","").encode()             # SRP password (try 'dSUeg=Qq' from FTP)
+_SRP_I = os.environ.get("AD600_SRP_USER","USER_LEVEL0").encode()   # SRP identity
+_SRP_P = os.environ.get("AD600_SRP_PASS","").encode()             # SRP password
 
 def _H(*parts):
     h = hashlib.sha256()
@@ -876,7 +886,7 @@ def join_probe():
         if os.environ.get("AD600_CFLEXPORT"):
             # WWB does a CFL-EXPORT handshake at connect that our client skips ENTIRELY (these are SETs;
             # FULLINV only replays GET/SUB). SET 0x0109002a=01 opens the transient FTP server; WWB then
-            # FTP-authenticates (wwb/dSUeg=Qq) and downloads /ssm_export.cfl; then SET 0x0109002a=02.
+            # FTP-authenticates (AD600_FTP_USER/AD600_FTP_PASS) and downloads /ssm_export.cfl; then SET 0x0109002a=02.
             # Even though the .cfl is empty, DOING this export (esp. the FTP auth) may enroll us as a
             # scan-data-eligible controller — the one wire step we've never performed.
             for c in ("700807020109002b",                 # SUB 0x0109002b
@@ -889,7 +899,7 @@ def join_probe():
                     import time as _t
                     for _ in range(int(os.environ.get("AD600_FTPRETRY","200"))):   # retry long enough to catch the window (opens after inventory drains)
                         try:
-                            f=ftplib.FTP(); f.connect(AD600_IP,21,timeout=1); f.login("wwb","dSUeg=Qq")
+                            f=ftplib.FTP(); f.connect(AD600_IP,21,timeout=1); f.login(os.environ.get("AD600_FTP_USER", ""), os.environ.get("AD600_FTP_PASS", ""))
                             buf=io.BytesIO(); f.retrbinary("RETR /ssm_export.cfl", buf.write)
                             b2=io.BytesIO();
                             try: f.retrbinary("RETR /ssm_export.dev", b2.write)
@@ -992,7 +1002,7 @@ def join_probe():
             sc_cmds.append(bytes.fromhex("702a0107002452465f5343414e3a43555252454e545f5245515545535445525f4349442f5343414e3d30"))  # GET
             print("   → REQCID diagnostic: SUB+GET RF_SCAN:CURRENT_REQUESTER_CID (who owns the scanner?)")
         # ── FTP-ENROLL GATE (defect #3) ──────────────────────────────────────────────────────────────
-        # WWB completes the CFL-export enroll (SET 0x0109002a=01 → FTP login wwb/dSUeg=Qq → RETR
+        # WWB completes the CFL-export enroll (SET 0x0109002a=01 → FTP login → RETR
         # /ssm_export.cfl + .dev → SET 0x0109002a=02) BEFORE it emits the RF_SCAN config/subscribe/START.
         # Our FTP runs on a daemon thread, so we must hold the CFL-close SETs *and* the RF_SCAN batch
         # until ftp_gate fires (login success). Otherwise the close SET can drain the FTP window shut and

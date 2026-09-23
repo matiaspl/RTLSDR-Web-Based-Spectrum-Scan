@@ -17,7 +17,7 @@ Restarts the subprocess on exit while running (like the .mjs agent). start()/sto
 Off-device safe: does NOTHING until start() is called with a discovered device.
 Stdlib only.
 """
-import os, sys, base64, struct, threading, subprocess, time, signal
+import os, sys, base64, struct, threading, subprocess, time, signal, secrets
 
 # Bundle-aware resource resolution: works from source AND from inside a py2app .app.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +30,18 @@ CONSOLE_PY = os.environ.get("AD600_CONSOLE_PY", os.path.join(CLIENT_DIR, "ad600_
 DEFAULT_FEED = os.environ.get("AD600_REACTIVE_FEED", "BUILTIN")
 # SCRATCH → a per-user WRITABLE dir (~/Library/Application Support/…), never inside the .app.
 SCRATCH = scratch_dir()
+CONSOLE_LOG_MAX_BYTES = 20 * 1024 * 1024   # rotate console_out.log past this (it's very chatty)
+
+
+def fresh_session_cid():
+    """A new random controller CID for every console session. A MAC-derived (or otherwise reused)
+    CID draws JOIN_REFUSE reason 6 (IDENTITY IN USE) on a quick reconnect, and on macOS the real
+    MAC is often hidden (02:00:00:00:00:00) so it isn't unique per machine either (findings §6.6)."""
+    try:
+        from ad600_discovery import CID_SUFFIX
+    except Exception:
+        CID_SUFFIX = "000011dda000000eddcccccc"
+    return "%08x" % (0x10000000 + secrets.randbelow(0xe0000000)) + CID_SUFFIX
 
 
 def _resolve_iface(iface):
@@ -120,6 +132,10 @@ class Engine:
         self._reader = None
         self._supervisor = None
         self._lock = threading.Lock()
+        self._rearm_lock = threading.Lock()
+        # Bumped only by an EXTERNAL stop() — never by _rearm_worker's own stop-then-restart — so a
+        # re-arm in progress can tell the operator stopped it and must not revive the session.
+        self._generation = 0
 
         # observable state (menubar)
         self.owner = None            # True / False / None (unknown)
@@ -132,8 +148,9 @@ class Engine:
         self._cmd_file = os.path.join(SCRATCH, "console_cmd.txt")   # for QUIT-FIRST clean stop
 
     # ─────────────────────────────── lifecycle ───────────────────────────────
-    def start(self, device, iface, our_cid):
-        """Begin the firehose against a DISCOVERED device on the selected interface."""
+    def start(self, device, iface, our_cid=None):
+        """Begin the firehose against a DISCOVERED device on the selected interface. `our_cid` is
+        only used for the first session; every console (re)launch gets a fresh one (_run_once)."""
         with self._lock:
             if self.running:
                 return
@@ -197,25 +214,57 @@ class Engine:
         want_repeat = self._requested_repeat()
         with self._lock:
             running = self.running
-            dev, ifc, cid = self.device, self.iface, self.our_cid
+            dev, ifc = self.device, self.iface
         changed = (want_comp != getattr(self, "_armed_rt_comp", None)
                    or want_range != getattr(self, "_armed_range", (None, None))
                    or want_curve_mask != getattr(self, "_armed_curve_mask", None)
                    or want_repeat != getattr(self, "_armed_repeat", None))
         if running and changed and dev:
-            threading.Thread(target=self._rearm, args=(dev, ifc, cid), daemon=True).start()
+            threading.Thread(target=self._rearm_worker, args=(dev, ifc), daemon=True).start()
 
-    def _rearm(self, dev, ifc, cid):
-        self.status_note = "re-arming at new RBW…"
-        self.stop()
-        # small settle so the device fully releases the slot before we re-claim it boot-first
-        time.sleep(1.0)
-        self.start(dev, ifc, cid)
+    def _config_differs(self):
+        return (self._requested_rt_comp() != getattr(self, "_armed_rt_comp", None)
+                or self._requested_range() != getattr(self, "_armed_range", (None, None))
+                or self._requested_curve_mask() != getattr(self, "_armed_curve_mask", None)
+                or self._requested_repeat() != getattr(self, "_armed_repeat", None))
 
-    def stop(self):
+    def _rearm_worker(self, dev, ifc):
+        """Restart the console at the new config. Only one worker runs at a time; it loops so a burst
+        of UI changes (e.g. RBW then range) collapses into as few re-arms as possible."""
+        if not self._rearm_lock.acquire(blocking=False):
+            return                       # the active worker will pick up the newer config
+        try:
+            while True:
+                with self._lock:
+                    running = self.running
+                    d = self.device or dev
+                    i = self.iface or ifc
+                    gen_before = self._generation
+                if not (running and d and self._config_differs()):
+                    break
+                self.status_note = "re-arming at new configuration…"
+                if hasattr(self.bridge, "reset_observed"):
+                    self.bridge.reset_observed()
+                self.stop(_internal=True)
+                # settle so the device fully releases the slot before we re-claim it
+                time.sleep(1.5)
+                with self._lock:
+                    if self._generation != gen_before:
+                        return           # operator stopped us mid-re-arm: stay stopped
+                self.start(d, i)
+                time.sleep(1.0)
+        except Exception as ex:
+            sys.stderr.write("[ad600_engine re-arm error] %r\n" % (ex,))
+        finally:
+            self._rearm_lock.release()
+
+    def stop(self, _internal=False):
         with self._lock:
+            if not _internal:
+                self._generation += 1
             self.running = False
             p = self.proc
+            sup = self._supervisor
         if p and p.poll() is None:
             # QUIT-FIRST clean stop: ask the console to disconnect cleanly (RELEASE_SCAN_ID + LEAVE)
             # via the cmd file and give it a REAL grace window to reach the wire, BEFORE any signal.
@@ -257,6 +306,10 @@ class Engine:
                     p.kill()
                 except Exception:
                     pass
+        if sup and sup is not threading.current_thread() and sup.is_alive():
+            # let the old supervisor observe running=False and exit before a re-arm starts a new
+            # one, so two supervisors never race to relaunch the console
+            sup.join(timeout=3.0)
         self.status_note = "stopped"
         self.streaming = False
 
@@ -350,6 +403,14 @@ class Engine:
         os.makedirs(SCRATCH, exist_ok=True)
         cmd_file = self._cmd_file = os.path.join(SCRATCH, "console_cmd.txt")
         log_file = os.path.join(SCRATCH, "console_out.log")
+        try:
+            if os.path.getsize(log_file) > CONSOLE_LOG_MAX_BYTES:
+                os.replace(log_file, log_file + ".1")
+        except OSError:
+            pass
+        # Fresh controller identity for EVERY console session — including the supervisor's
+        # automatic relaunches and re-arms — never a reused one (findings §6.6).
+        self.our_cid = fresh_session_cid()
         # the console loads the feed via one control line, then owner-claim drives the arm.
         # Shared with Bridge's /bias handler, which appends to this same file from the HTTP
         # thread — take its lock so a truncate here can't land mid-append and lose a command.

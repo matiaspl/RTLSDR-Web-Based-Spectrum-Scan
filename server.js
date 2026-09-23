@@ -9,9 +9,9 @@ const SLP_MULTICAST_ADDR = '239.255.254.253';
 // App State
 let appState = {
   interfaces: [], // list of { name, address }
-  selectedInterface: 'en6', // target device is on en6
-  discoveredDevices: {}, // ip -> { ip, model, cid, sdtPort, lastSeen }
-  activeTargetIp: '169.254.244.206',
+  selectedInterface: 'ALL', // 'ALL' = auto: pick the NIC whose subnet contains the device
+  discoveredDevices: {}, // ip -> { ip, model, cid, iface, sdtPort, lastSeen }
+  activeTargetIp: null,
   activeTargetModel: 'Shure AD600 Spectrum Manager',
   activeTargetSdtPort: 57383,
   connectionState: 'DISCONNECTED', // 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED'
@@ -39,6 +39,8 @@ let appState = {
     'E': false,
     'F': false
   },
+  antennaBiasPending: {}, // ant -> { enabled, t } awaiting device confirmation
+  scanSlotOwned: false,
   antennaNames: {
     'A': '',
     'B': '',
@@ -47,7 +49,6 @@ let appState = {
     'E': '',
     'F': ''
   },
-  temperature: null,
   scanMode: 'CONTINUOUS', // 'CONTINUOUS' | 'SINGLE'
   curveMask: 0x7E,
   rbwHz: 350000,
@@ -83,7 +84,7 @@ function getNetworkInterfaces() {
   for (const name in interfaces) {
     for (const net of interfaces[name]) {
       if (net.family === 'IPv4' && !net.internal) {
-        validIps.push({ name, address: net.address, mac: net.mac });
+        validIps.push({ name, address: net.address, netmask: net.netmask, mac: net.mac });
       }
     }
   }
@@ -91,15 +92,42 @@ function getNetworkInterfaces() {
   return validIps;
 }
 
+function ipv4ToInt(ip) {
+  const p = String(ip || '').split('.').map(Number);
+  if (p.length !== 4 || p.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+}
+
+// The local NIC whose real subnet (address + netmask) contains `ip`, or null. Works equally for a
+// link-local direct connection (169.254/16) and a routed/DHCP LAN — never a guessed prefix or a
+// hardcoded interface name (findings §6.6).
+function ifaceForHost(ip) {
+  const target = ipv4ToInt(ip);
+  if (target === null) return null;
+  for (const nic of appState.interfaces) {
+    const addr = ipv4ToInt(nic.address);
+    const mask = ipv4ToInt(nic.netmask);
+    if (addr === null || mask === null) continue;
+    if (((addr & mask) >>> 0) === ((target & mask) >>> 0)) return nic;
+  }
+  return null;
+}
+
 // 2. 1.8 Engine Process Manager & Multi-Antenna Trace Aggregator
 const { spawn, exec, execSync, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const SCANNER_DIR = path.join(__dirname, '..', '1.8', 'extracted', 'AD600_Scanner');
-const ENGINE_BIN = path.join(SCANNER_DIR, 'ad600_engine_bin');
-const DISCOVER_BIN = path.join(SCANNER_DIR, 'ad600_discover_bin');
-const RUN_DIR = path.join(SCANNER_DIR, 'run');
+const ENGINE_DIR = path.join(__dirname, 'engine');
+// App-private scratch dir (console_cmd.txt / console_out.log). Deliberately NOT ~/.ad600_scanner,
+// which the SoundBase AD600 plugin also uses.
+const SCRATCH_DIR = process.env.AD600_ENGINE_SCRATCH || path.join(os.homedir(), '.ad600_node_app');
+const CMD_FILE = path.join(SCRATCH_DIR, 'console_cmd.txt');
+const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
+const BRIDGE_PORT = 8088;
+// Physically impossible readings are decode artifacts (findings §6.3), never real RF.
+const SANE_MIN_DBM = -125.0;
+const SANE_MAX_DBM = 20.0;
 
 // Dynamic spectrum datasets per antenna (A..F) with authentic hardware frequency bins
 const ANT_COLORS = {
@@ -135,34 +163,15 @@ function initUdpBeaconDiscovery() {
       const ip = rinfo.address;
       const str = msg.toString('utf8');
 
-      // Match CID if present in beacon attributes
+      // Only AD600 adverts; other Shure gear (and WWB/SoundBase controllers) also talk on 8427.
+      if (!/AD600/i.test(str)) return;
+
+      // Match CID if present in the advert. Unknown stays null — the engine bootstrap resolves it
+      // by discovery before JOIN rather than guessing another unit's identity.
       const cidMatch = str.match(/\(cid=([A-Fa-f0-9-]+)\)/);
-      const cid = cidMatch ? cidMatch[1].replace(/-/g, '').toLowerCase() : 'dda2210d000011dda000000eddcccccc';
-
-      // Match interface for this IP address
-      let matchedIface = 'en6';
-      appState.interfaces.forEach(nic => {
-        const netPrefix = nic.address.split('.').slice(0, 2).join('.');
-        if (ip.startsWith(netPrefix)) matchedIface = nic.name;
-      });
-
-      if (!appState.discoveredDevices[ip]) {
-        console.log(`[UDP BEACON DISCOVERY SUCCESS] Found Shure Hardware @ ${ip} on ${matchedIface} (CID: ${cid})`);
-      }
-
-      appState.discoveredDevices[ip] = {
-        ip: ip,
-        model: 'Shure AD600 Spectrum Manager',
-        cid: cid,
-        iface: matchedIface,
-        sdtPort: 57383,
-        lastSeen: Date.now()
-      };
-
-      if (!appState.activeTargetIp || ip === '169.254.244.206') {
-        appState.activeTargetIp = ip;
-        appState.status = `DISCOVERED AD600 @ ${ip} (${matchedIface}) - READY`;
-      }
+      const cid = cidMatch ? cidMatch[1].replace(/-/g, '').toLowerCase() : null;
+      const nic = ifaceForHost(ip);
+      recordDiscoveredDevice(ip, cid, nic ? nic.name : null, 'beacon');
     });
 
     udpDiscoverySocket.bind(8427, '0.0.0.0', () => {
@@ -184,49 +193,93 @@ function initUdpBeaconDiscovery() {
   }
 }
 
-function runDiscovery18(targetIface = null) {
+function recordDiscoveredDevice(ip, cid, ifaceName, source, sdtPort) {
+  const prev = appState.discoveredDevices[ip];
+  if (!prev) {
+    console.log(`[DISCOVERY] Found AD600 @ ${ip} on ${ifaceName || '?'} via ${source} (CID: ${cid || 'unknown'})`);
+  }
+  appState.discoveredDevices[ip] = {
+    ip: ip,
+    model: 'Shure AD600 Spectrum Manager',
+    cid: cid || (prev && prev.cid) || null,
+    iface: ifaceName || (prev && prev.iface) || null,
+    sdtPort: sdtPort || (prev && prev.sdtPort) || 57383,
+    lastSeen: Date.now()
+  };
+  if (!appState.activeTargetIp) {
+    appState.activeTargetIp = ip;
+    if (appState.connectionState === 'DISCONNECTED') {
+      appState.status = `DISCOVERED AD600 @ ${ip} (${ifaceName || '?'}) - READY`;
+    }
+  }
+}
+
+// Active SLP discovery via the bundled engine/ad600_discovery.py (stdlib only), one probe per NIC.
+const DISCOVERY_PY = `
+import sys, json
+sys.path.insert(0, sys.argv[1])
+import ad600_discovery as d
+rec = d.discover(sys.argv[2], timeout=4)
+print(json.dumps(rec or None))
+`;
+
+function runDiscovery(targetIface = null) {
   initUdpBeaconDiscovery();
-  if (!fs.existsSync(DISCOVER_BIN)) return;
-
-  try {
-    execSync(`xattr -dr com.apple.quarantine "${SCANNER_DIR}" 2>/dev/null || true`);
-  } catch (e) {}
-
-  const ifacesToProbe = (targetIface && targetIface !== 'ALL') 
-    ? [targetIface] 
-    : (appState.interfaces.length ? appState.interfaces.map(i => i.name) : ['en6']);
+  getNetworkInterfaces();
+  const ifacesToProbe = (targetIface && targetIface !== 'ALL')
+    ? [targetIface]
+    : appState.interfaces.map(i => i.name);
 
   ifacesToProbe.forEach(iface => {
     // execFile (not exec) so `iface` is passed as a literal argv entry, never interpreted by a shell.
-    execFile(DISCOVER_BIN, [iface], { cwd: SCANNER_DIR, timeout: 12000 }, (err, stdout, stderr) => {
+    execFile(PYTHON_BIN, ['-c', DISCOVERY_PY, ENGINE_DIR, iface], { timeout: 15000 }, (err, stdout) => {
       if (err) return;
-      const out = (stdout || '').trim();
-      if (out) {
-        const parts = out.split(/\s+/);
-        if (parts.length >= 2) {
-          const ip = parts[0];
-          const cid = parts[1];
-          const devIface = parts[2] || iface;
-          if (!appState.activeTargetIp || ip === '169.254.244.206') {
-            appState.activeTargetIp = ip;
-            appState.status = `DISCOVERED AD600 @ ${ip} (${devIface}) - READY`;
-          }
-          appState.discoveredDevices[ip] = {
-            ip: ip,
-            model: 'Shure AD600 Spectrum Manager',
-            cid: cid,
-            iface: devIface,
-            sdtPort: 57383,
-            lastSeen: Date.now()
-          };
-          console.log(`[1.8 DISCOVERY SUCCESS] Found AD600 at ${ip} on interface ${devIface} (CID: ${cid})`);
-        }
-      }
+      let rec = null;
+      try { rec = JSON.parse((stdout || '').trim().split('\n').pop()); } catch (e) { return; }
+      if (!rec || !rec.device_ip) return;
+      recordDiscoveredDevice(rec.device_ip, rec.device_cid, rec.iface || iface, 'SLP', rec.device_port);
     });
   });
 }
 
 let bridgePollInterval = null;
+
+// Engine stdout lines worth echoing to this console. Everything else (per-PDU DMP chatter) is still
+// in SCRATCH_DIR/console_out.log — echoing it all here produced ~30 MB/hour of output.
+const ENGINE_LOG_NOISE_RE = /FIREHOSE EVENT|SWEEP-ID EVENT|BIG PACKET|DEEP-TREE SUB ACCEPTED/;
+const ENGINE_LOG_RE = /★|⚠|✪|JOIN|REFUSE|IDENTITY|OWNERSHIP CLAIMED|NOT OWNER|ABORT|RELEASE|clean disconnect|QUIT|SLP advert|re-arm|Traceback|Error|error|DISCOVERY|\[RF ENGINE\]|\[ENGINE STATUS\]|RUNNING ON PORT/;
+
+// Handshake milestones → operator-facing progress. JOIN → ownership → first sweep takes ~20-30 s
+// on real hardware (findings §6.1), so each stage is surfaced rather than looking like a hang.
+function applyEngineMilestone(line, targetIp) {
+  if (/SLP advert sent/.test(line)) {
+    appState.status = `ANNOUNCING TO AD600 @ ${targetIp}...`;
+  } else if (/JOIN sent/.test(line)) {
+    appState.status = `JOINING SESSION WITH AD600 @ ${targetIp}...`;
+  } else if (/JOIN_REFUSE|IDENTITY IN USE/.test(line)) {
+    appState.status = 'AD600 REFUSED THE SESSION - RETRYING...';
+  } else if (/^CONNECTED$/.test(line.trim()) || /\*\*\* JOINED/.test(line)) {
+    if (appState.connectionState !== 'CONNECTED') {
+      appState.connectionState = 'CONNECTED';
+      console.log('[CONNECTION] AD600 session established');
+    }
+    appState.status = appState.scanState === 'SCANNING'
+      ? 'CONNECTED - CLAIMING SCAN SLOT (FIRST SWEEP IN ~30 s)...'
+      : `CONNECTED TO AD600 @ ${targetIp} - READY`;
+  } else if (/clean-grant fan-out complete/.test(line)) {
+    if (appState.scanState === 'SCANNING') appState.status = 'CONNECTED - PRIMING SCAN ENGINE...';
+  } else if (/OWNERSHIP CLAIMED/.test(line)) {
+    appState.scanSlotOwned = true;
+    if (appState.scanState === 'SCANNING') appState.status = 'SCAN SLOT CLAIMED - WAITING FOR FIRST SWEEP...';
+  } else if (/NOT OWNER \(|ABORTING arm|NOT-OWNER \(GET_FAIL/.test(line)) {
+    appState.scanSlotOwned = false;
+    appState.status = 'SCAN SLOT HELD BY ANOTHER CONTROLLER (WWB / SOUNDBASE?) - CLOSE IT OR POWER-CYCLE THE AD600';
+  } else if (/^\[ENGINE STATUS\]/.test(line) && /slot-0|power-cycle|couldn't start|launch failed|reconnecting/.test(line)) {
+    appState.status = line.replace(/^\[ENGINE STATUS\]\s*/, '').toUpperCase();
+  } else if (/^\[DISCOVERY FAILED\]/.test(line)) {
+    appState.status = line.replace(/^\[DISCOVERY FAILED\]\s*/, '').toUpperCase();
+  }
+}
 
 function start18EngineScan() {
   if (engineProcess) return;
@@ -236,41 +289,45 @@ function start18EngineScan() {
   // installation's own absolute script paths rather than bare filenames, so it can't match an
   // unrelated process that happens to share a script name.
   try {
-    const consolePyPath = path.join(__dirname, 'engine', 'ad600_console.py');
+    const consolePyPath = path.join(ENGINE_DIR, 'ad600_console.py');
     const bootstrapPyPath = path.join(os.tmpdir(), 'ad600_bridge_launch.py');
     execSync(`pkill -15 -f "${consolePyPath}" 2>/dev/null || true`);
     execSync(`pkill -15 -f "${bootstrapPyPath}" 2>/dev/null || true`);
   } catch (e) {}
 
-  const targetIp = appState.activeTargetIp || '169.254.244.206';
+  getNetworkInterfaces();
+  const targetIp = appState.activeTargetIp;
+  if (!targetIp) {
+    appState.connectionState = 'DISCONNECTED';
+    appState.status = 'NO AD600 DISCOVERED YET - CHECK CABLING / INTERFACE';
+    return;
+  }
   const targetDev = appState.discoveredDevices[targetIp];
-  const devCid = targetDev?.cid || 'dda2210d000011dda000000eddcccccc';
 
-  const selectedNic = (appState.selectedInterface && appState.selectedInterface !== 'ALL') 
-    ? appState.selectedInterface 
-    : (targetDev?.iface || 'en6');
-  const ifaceObj = appState.interfaces.find(i => i.name === selectedNic);
-  const nicIp = ifaceObj?.address || '169.254.36.3';
-  const nicMac = ifaceObj?.mac || 'a0:ce:c8:7f:ec:06';
-
-  const engineDir = path.join(__dirname, 'engine');
-  const scratchDir = path.join(os.homedir(), '.ad600_scanner');
-
-  let pythonBin = process.platform === 'win32' ? 'python' : 'python3';
-  if (process.env.PYTHON_BIN) {
-    pythonBin = process.env.PYTHON_BIN;
+  // An explicitly chosen NIC wins; otherwise pick the one whose real subnet contains the device.
+  let ifaceObj = null;
+  if (appState.selectedInterface && appState.selectedInterface !== 'ALL') {
+    ifaceObj = appState.interfaces.find(i => i.name === appState.selectedInterface) || null;
+  }
+  if (!ifaceObj) ifaceObj = ifaceForHost(targetIp);
+  if (!ifaceObj && targetDev && targetDev.iface) {
+    ifaceObj = appState.interfaces.find(i => i.name === targetDev.iface) || null;
+  }
+  if (!ifaceObj) {
+    appState.connectionState = 'DISCONNECTED';
+    appState.status = `NO NETWORK INTERFACE ON THE SAME SUBNET AS ${targetIp}`;
+    return;
   }
 
-  console.log(`[RF ENGINE] Spawning Python Bridge for ${targetIp} on ${selectedNic} (${nicIp}, MAC ${nicMac})...`);
-  console.log(`[ENGINE DIR] ${engineDir}`);
+  console.log(`[RF ENGINE] Spawning Python bridge for ${targetIp} on ${ifaceObj.name} (${ifaceObj.address}/${ifaceObj.netmask})...`);
 
   const env = Object.assign({}, process.env, {
-    PYTHONPATH: engineDir,
-    AD600_ENGINE_DIR: engineDir,
-    AD600_CLIENT_DIR: engineDir,
-    AD600_CONSOLE_PY: path.join(engineDir, 'ad600_console.py'),
+    PYTHONPATH: ENGINE_DIR,
+    AD600_ENGINE_DIR: ENGINE_DIR,
+    AD600_CLIENT_DIR: ENGINE_DIR,
+    AD600_CONSOLE_PY: path.join(ENGINE_DIR, 'ad600_console.py'),
     AD600_REACTIVE_FEED: 'BUILTIN',
-    AD600_ENGINE_SCRATCH: scratchDir,
+    AD600_ENGINE_SCRATCH: SCRATCH_DIR,
     AD600_RT_COMPRESSION: String(appState.rbwComp || '14'),
     AD600_CURVE_SELECT: String(computeCurveMask(appState.selectedAntennas)),
     AD600_REPEAT: appState.scanMode === 'SINGLE' ? '1' : '255',
@@ -287,18 +344,21 @@ function start18EngineScan() {
 
   // Ensure scratch directory exists and command file is clean for new connection
   try {
-    if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir, { recursive: true });
-    fs.writeFileSync(path.join(scratchDir, 'console_cmd.txt'), '');
+    fs.mkdirSync(SCRATCH_DIR, { recursive: true });
+    fs.writeFileSync(CMD_FILE, '');
   } catch (e) {}
 
-  // Runtime values (interface name, discovered device CID, MAC, etc.) are passed to the
-  // bootstrap script via a JSON file rather than interpolated into Python source: JSON.stringify
-  // properly escapes them, so nothing here can break out of a Python string literal — unlike the
-  // old approach, which let an unvalidated interface name become arbitrary injected Python.
+  // Runtime values (interface, device record) are passed to the bootstrap script via a JSON file
+  // rather than interpolated into Python source, so nothing here can inject Python.
   const bridgeConfigPath = path.join(os.tmpdir(), 'ad600_bridge_config.json');
   const bridgeConfig = {
-    iface: { name: selectedNic, ipv4: nicIp, mac: nicMac },
-    device: { device_ip: targetIp, device_cid: devCid, device_port: 57383 },
+    iface: { name: ifaceObj.name, ipv4: ifaceObj.address, netmask: ifaceObj.netmask, mac: ifaceObj.mac },
+    device: {
+      device_ip: targetIp,
+      device_cid: (targetDev && targetDev.cid) || null,
+      device_port: (targetDev && targetDev.sdtPort) || 57383
+    },
+    bridgePort: BRIDGE_PORT,
     startHz: Math.round((appState.startFreqMhz || 470.0) * 1e6),
     stopHz: Math.round((appState.endFreqMhz || 608.0) * 1e6),
     rbwHz: appState.rbwHz || 350000,
@@ -312,13 +372,12 @@ function start18EngineScan() {
     console.log('[RF ENGINE] Failed to write bridge config JSON:', e.message);
   }
 
-  // Write the Python bootstrap script to a temp file so __file__ is set correctly. The only
-  // JS values interpolated below are Node-controlled filesystem paths (JSON.stringify-escaped),
-  // never user- or network-supplied data.
+  // Written to a temp file so __file__ is set correctly. The only JS values interpolated below are
+  // Node-controlled filesystem paths (JSON.stringify-escaped), never user- or network-supplied data.
   const tmpScript = path.join(os.tmpdir(), 'ad600_bridge_launch.py');
   const pyCode = `
 import os, sys, time, signal, atexit, json
-sys.path.insert(0, ${JSON.stringify(engineDir)})
+sys.path.insert(0, ${JSON.stringify(ENGINE_DIR)})
 import ad600_bridge, ad600_engine, ad600_discovery
 
 with open(${JSON.stringify(bridgeConfigPath)}, 'r', encoding='utf-8') as _cf:
@@ -327,21 +386,30 @@ with open(${JSON.stringify(bridgeConfigPath)}, 'r', encoding='utf-8') as _cf:
 iface = _cfg['iface']
 dev = _cfg['device']
 
-mac = iface.get('mac')
-if not mac or mac.startswith('02:00') or mac.startswith('00:00'):
-    mac = 'a0:ce:c8:7f:ec:06'
-our_cid = ad600_discovery.derive_our_cid(mac)
-print(f'[RF ENGINE] Controller CID: {our_cid} | Target Device CID: {dev["device_cid"]}')
+# The console needs the device's CID for JOIN. If the beacon didn't carry it, ask the device via
+# SLP on the chosen interface rather than guessing some other unit's identity.
+if not dev.get('device_cid'):
+    rec = None
+    try:
+        rec = ad600_discovery.discover(iface['name'], timeout=6)
+    except Exception as e:
+        sys.stderr.write('discovery error: %r\\n' % (e,))
+    if rec and rec.get('device_ip') == dev['device_ip'] and rec.get('device_cid'):
+        dev['device_cid'] = rec['device_cid']
+        dev['device_port'] = rec.get('device_port') or dev['device_port']
+    else:
+        print('[DISCOVERY FAILED] AD600 @ %s did not answer SLP on %s - check cabling' % (dev['device_ip'], iface['name']))
+        sys.stdout.flush()
+        sys.exit(2)
 
-br = ad600_bridge.Bridge(port=8088)
+print('[RF ENGINE] Target device CID: %s (controller CID is regenerated per session)' % dev['device_cid'])
 
-# Start HTTP server in background thread (block=False)
+br = ad600_bridge.Bridge(port=_cfg['bridgePort'])
 br.serve(block=False)
 
 eng = ad600_engine.Engine(bridge=br)
 br.on_config_change = eng.apply_config
 
-# Apply configuration
 try:
     br.apply_configuration({
         'startHz': _cfg['startHz'],
@@ -354,9 +422,7 @@ except Exception as e:
     sys.stderr.write('CONFIG ERR: ' + str(e) + '\\n')
 
 def _cleanup(*args):
-    # eng.stop() runs the graceful QUIT-FIRST teardown (releases the scan slot) before any hard
-    # kill. Killing eng.proc first (as this used to do) skipped that teardown and could leave the
-    # device's slot-0 lease stale until a power-cycle.
+    # eng.stop() runs the graceful QUIT-FIRST teardown (releases the scan slot) before any hard kill.
     try:
         eng.stop()
     except Exception:
@@ -371,27 +437,29 @@ atexit.register(_cleanup)
 signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
 signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
 
-eng.start(dev, iface, our_cid)
+eng.start(dev, iface)
 
-# Start sweeping if scanState is SCANNING
 if _cfg.get('startSweep'):
     br.sweep_start()
 
-sys.stdout.write('PYTHON RF BRIDGE ENGINE RUNNING ON PORT 8088\\n')
+sys.stdout.write('PYTHON RF BRIDGE ENGINE RUNNING ON PORT %d\\n' % _cfg['bridgePort'])
 sys.stdout.flush()
 
-# Keep alive
+# Report only the supervisor's human-readable note, and only when it changes.
+_last = None
 while True:
     time.sleep(1)
-    st = eng.status()
-    if st:
-        sys.stdout.write('[ENGINE STATUS] ' + str(st) + '\\n')
+    note = (eng.status() or {}).get('note') or ''
+    if note and note != _last:
+        sys.stdout.write('[ENGINE STATUS] ' + note + '\\n')
         sys.stdout.flush()
+    _last = note
 `;
 
   fs.writeFileSync(tmpScript, pyCode);
-  const proc = spawn(pythonBin, [tmpScript], { env });
+  const proc = spawn(PYTHON_BIN, [tmpScript], { env });
   engineProcess = proc;
+  appState.scanSlotOwned = false;
 
   let stdoutBuffer = '';
   proc.stdout.on('data', d => {
@@ -399,62 +467,38 @@ while True:
     stdoutBuffer += d.toString('utf8');
     const completeLines = stdoutBuffer.split('\n');
     stdoutBuffer = completeLines.pop(); // keep the trailing partial line for the next chunk
-    if (completeLines.length === 0) return;
-    const text = completeLines.join('\n') + '\n';
-    console.log('[1.8 ENGINE STDOUT]', text.trim());
-
-    if (text.includes('CONNECTED') || text.includes('OWNERSHIP CLAIMED') || text.includes('ACCESS-LEVEL') || text.includes('SCAN-READY') || text.includes('SCAN-OWNERSHIP')) {
-      if (appState.connectionState !== 'CONNECTED') {
-        appState.connectionState = 'CONNECTED';
-        if (appState.scanState === 'SCANNING') {
-          appState.status = `SCANNING AD600 HARDWARE @ ${targetIp}`;
-        } else {
-          appState.status = `CONNECTED TO AD600 @ ${targetIp} - READY`;
-        }
-        console.log(`[CONNECTION] AD600 Connection Established & Ownership Confirmed!`);
-        pollHardwareBias();
-      }
-    } else if (text.includes('NOT OWNER') || text.includes('ABORTING arm')) {
-      appState.connectionState = 'DISCONNECTED';
-      appState.status = 'AD600 CONNECTION REFUSED - SLOT TAKEN (TRY POWER-CYCLING AD600)';
-    }
 
     for (const l of completeLines) {
+      if (ENGINE_LOG_RE.test(l) && !ENGINE_LOG_NOISE_RE.test(l)) console.log('[ENGINE]', l.trim());
+      applyEngineMilestone(l, targetIp);
       const match = l.match(/^BIAS\s+([A-F])\s+([01])/i);
       if (match) {
         const ant = match[1].toUpperCase();
         const isOn = match[2] === '1';
+        if (appState.antennaBias[ant] !== isOn) {
+          console.log(`[BIAS] Antenna ${ant} bias reported ${isOn ? 'ON' : 'OFF'} by device`);
+        }
         appState.antennaBias[ant] = isOn;
-        console.log(`[HARDWARE BIAS TELEMETRY] Antenna ${ant} Bias is ${isOn ? 'ON' : 'OFF'}`);
-      }
-      const tempMatch = l.match(/^TEMP\s+([0-9.]+)/i);
-      if (tempMatch) {
-        const c = parseFloat(tempMatch[1]);
-        const f = +(c * 9 / 5 + 32).toFixed(1);
-        appState.temperature = {
-          celsius: c,
-          fahrenheit: f,
-          status: c > 55 ? 'HIGH' : 'NORMAL',
-          fan: c > 50 ? 'High' : 'Normal'
-        };
-        console.log(`[HARDWARE TEMP TELEMETRY] Internal Temperature: ${c}°C (${f}°F)`);
+        const pend = appState.antennaBiasPending[ant];
+        if (pend && pend.enabled === isOn) delete appState.antennaBiasPending[ant];
       }
     }
   });
 
   proc.stderr.on('data', d => {
     if (engineProcess !== proc) return;
-    console.log('[1.8 ENGINE STDERR]', d.toString('utf8').trim());
+    console.log('[ENGINE STDERR]', d.toString('utf8').trim());
   });
 
   proc.on('exit', (code) => {
-    console.log(`[1.8 ENGINE] Process exited with code ${code}`);
+    console.log(`[ENGINE] Process exited with code ${code}`);
     if (engineProcess !== proc) return; // a newer engine process already replaced this one
     engineProcess = null;
     appState.connectionState = 'DISCONNECTED';
-    appState.temperature = null;
-    if (appState.scanState === 'SCANNING') {
-      appState.scanState = 'STOPPED';
+    appState.scanSlotOwned = false;
+    appState.antennaBiasPending = {};
+    if (appState.scanState === 'SCANNING') appState.scanState = 'STOPPED';
+    if (!/DISCOVERY|NO NETWORK|SLOT HELD/.test(appState.status)) {
       appState.status = 'DISCONNECTED FROM AD600';
     }
     if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
@@ -463,101 +507,53 @@ while True:
   startBridgePolling();
 }
 
-// Background thermal update loop to simulate realistic slight ADC thermistor drift
-setInterval(() => {
-  if (appState.connectionState === 'CONNECTED') {
-    const base = 41.4;
-    const drift = Math.sin(Date.now() / 12000) * 0.6 + (Math.random() * 0.15 - 0.07);
-    const c = +(base + drift).toFixed(1);
-    const f = +(c * 9 / 5 + 32).toFixed(1);
-    appState.temperature = {
-      celsius: c,
-      fahrenheit: f,
-      status: 'NORMAL',
-      fan: 'Normal'
-    };
-  } else {
-    appState.temperature = null;
-  }
-}, 3000);
-
-function pollHardwareBias() {
-  const scratchDir = path.join(os.homedir(), '.ad600_scanner');
+// One-shot bias read (e.g. an explicit re-Connect while already connected). No periodic polling:
+// the console GETs + SUBSCRIBEs bias on connect, so changes arrive as device EVENTs.
+function requestBiasRefresh() {
   try {
-    if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir, { recursive: true });
     let cmds = '';
-    for (let i = 0; i < 6; i++) {
-      cmds += `get 0107047${i}\n`; // bias ports A-F
-    }
-    // Also query internal temperature addresses
-    cmds += 'get 0100007b\nget 010c0010\nget 01010104\n';
-    fs.appendFileSync(path.join(scratchDir, 'console_cmd.txt'), cmds);
-    console.log('[BIAS & TEMP POLL] Dispatched DMP GET queries for bias (01070470–75) and temp');
+    for (let i = 0; i < 6; i++) cmds += `get 0107047${i}\n`;
+    fs.appendFileSync(CMD_FILE, cmds);
   } catch (e) {
-    console.error('[BIAS & TEMP POLL ERR]', e.message);
+    console.error('[BIAS REFRESH ERR]', e.message);
   }
 }
 
-// Periodic hardware bias & telemetry refresh loop while connected
+// A bias change is only shown as done once the device reports it; unconfirmed requests expire.
+const BIAS_CONFIRM_TIMEOUT_MS = 6000;
 setInterval(() => {
-  if (appState.connectionState === 'CONNECTED') {
-    pollHardwareBias();
+  const now = Date.now();
+  for (const [ant, pend] of Object.entries(appState.antennaBiasPending)) {
+    if (now - pend.t > BIAS_CONFIRM_TIMEOUT_MS) {
+      delete appState.antennaBiasPending[ant];
+      appState.status = `BIAS CHANGE ON ANTENNA ${ant} NOT CONFIRMED BY THE AD600`;
+      console.log(`[BIAS] Antenna ${ant} change to ${pend.enabled ? 'ON' : 'OFF'} was not confirmed`);
+    }
   }
-}, 3500);
+}, 1000);
 
-let bridgePollCount = 0;
 let lastProcessedSweepId = -1;
+let bridgePollInFlight = false;
 function startBridgePolling() {
   if (bridgePollInterval) return;
-  // Poll 1.8 Bridge HTTP trace endpoint at http://127.0.0.1:8088/trace
   bridgePollInterval = setInterval(() => {
     if (!engineProcess) {
       clearInterval(bridgePollInterval);
       bridgePollInterval = null;
       return;
     }
+    // /trace long-polls when no trace exists yet — never stack requests behind it.
+    if (bridgePollInFlight) return;
+    bridgePollInFlight = true;
 
-    const req = http.get('http://127.0.0.1:8088/trace', res => {
+    const req = http.get(`http://127.0.0.1:${BRIDGE_PORT}/trace`, res => {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
+        bridgePollInFlight = false;
+        if (res.statusCode !== 200) return; // 409 = no sweep yet; the stdout milestones drive status
         try {
           const json = JSON.parse(body);
-          if (json.antennaBias && typeof json.antennaBias === 'object') {
-            for (const [ant, on] of Object.entries(json.antennaBias)) {
-              if (appState.antennaBias[ant] !== undefined) {
-                appState.antennaBias[ant] = !!on;
-              }
-            }
-          }
-          if (appState.connectionState === 'CONNECTING') {
-            appState.connectionState = 'CONNECTED';
-            if (appState.scanState !== 'SCANNING') {
-              appState.status = `CONNECTED TO AD600 @ ${appState.activeTargetIp || '169.254.244.206'} - READY`;
-            }
-          }
-          bridgePollCount++;
-          if (bridgePollCount % 10 === 0 && appState.connectionState === 'CONNECTED') {
-            http.get('http://127.0.0.1:8088/bias', bRes => {
-              let bBody = '';
-              bRes.on('data', c => bBody += c);
-              bRes.on('end', () => {
-                try {
-                  const bJson = JSON.parse(bBody);
-                  if (bJson && typeof bJson === 'object') {
-                    for (const [ant, on] of Object.entries(bJson)) {
-                      if (appState.antennaBias[ant] !== undefined) {
-                        appState.antennaBias[ant] = !!on;
-                      }
-                    }
-                  }
-                } catch (e) {}
-              });
-            }).on('error', () => {});
-          }
-          if (bridgePollCount % 25 === 0 && appState.connectionState === 'CONNECTED') {
-            pollHardwareBias();
-          }
           if (json.startHz && json.stopHz && json.stepHz) {
             appState.grid = {
               startHz: json.startHz,
@@ -569,72 +565,77 @@ function startBridgePolling() {
             appState.endFreqMhz = json.stopHz / 1e6;
           }
           if (json.series && Array.isArray(json.series) && appState.scanState === 'SCANNING' && appState.connectionState === 'CONNECTED') {
-            const isNewSweep = json.sweepId !== undefined && json.sweepId !== lastProcessedSweepId;
-            if (isNewSweep) {
-              lastProcessedSweepId = json.sweepId;
-              appState.scansCaptured = json.sweepId;
-              appState.lastScanTime = Date.now();
-            }
+            const isNewData = json.sweepId !== undefined && json.sweepId !== lastProcessedSweepId;
+            if (!isNewData) return;
+            lastProcessedSweepId = json.sweepId;
+            const prevCount = appState.scansCaptured;
+            appState.scansCaptured = json.sweepCount || 0;
+            appState.lastScanTime = Date.now();
 
             json.series.forEach(s => {
-              const antName = s.name; // 'A', 'B', 'C', 'D', 'E', 'F'
+              const antName = s.name; // 'A'..'F'
               const rawAmps = s.amplitudesDbm || [];
-              if (rawAmps.length > 0) {
-                if (!antennaTraces[antName] || antennaTraces[antName].length !== rawAmps.length) {
-                  antennaTraces[antName] = rawAmps.slice();
-                } else {
-                  for (let i = 0; i < rawAmps.length; i++) {
-                    // Overwrite only with valid data (> -125 dBm) to retain previous sweep on dropped packets
-                    if (rawAmps[i] > -125.0 || antennaTraces[antName][i] === undefined) {
-                      antennaTraces[antName][i] = rawAmps[i];
-                    }
+              if (rawAmps.length === 0) return;
+              if (!antennaTraces[antName] || antennaTraces[antName].length !== rawAmps.length) {
+                antennaTraces[antName] = rawAmps.map(v => (v > SANE_MIN_DBM && v <= SANE_MAX_DBM ? v : SANE_MIN_DBM - 5));
+              } else {
+                for (let i = 0; i < rawAmps.length; i++) {
+                  // Overwrite only with sane readings, retaining the previous value for empty bins
+                  // and for decode artifacts above the physical ceiling.
+                  const v = rawAmps[i];
+                  if ((v > SANE_MIN_DBM && v <= SANE_MAX_DBM) || antennaTraces[antName][i] === undefined) {
+                    antennaTraces[antName][i] = v;
                   }
                 }
               }
             });
 
             const curRbwKhz = Math.round((appState.grid?.stepHz || 350000) / 1000);
-            const curPts = appState.grid?.pointCount || (antennaTraces['A'] ? antennaTraces['A'].length : 0);
-            appState.status = `SCANNING AD600 HARDWARE - ${curRbwKhz} kHz RBW (${curPts} Pts)`;
-            if (isNewSweep && appState.scansCaptured % 5 === 1) {
+            const curPts = appState.grid?.pointCount || 0;
+            // A wide span at a fine RBW arrives as tiles at very uneven rates (findings §6.2) —
+            // say so until every part of the band has been seen at least once.
+            appState.status = json.coverageComplete === false
+              ? `SCANNING - FILLING BAND ${json.coveragePct || 0}% (${curRbwKhz} kHz RBW, ${curPts} Pts)`
+              : `SCANNING AD600 HARDWARE - ${curRbwKhz} kHz RBW (${curPts} Pts)`;
+            if (appState.scansCaptured !== prevCount && appState.scansCaptured % 10 === 1) {
               const summary = json.series.map(s => {
                 const arr = s.amplitudesDbm || [];
-                const max = arr.length ? Math.max(...arr).toFixed(1) : 'N/A';
-                return `${s.name}: max ${max} dBm`;
+                return `${s.name}: max ${arr.length ? Math.max(...arr).toFixed(1) : 'N/A'} dBm`;
               }).join(' | ');
-              console.log(`[FULL SWEEP #${appState.scansCaptured}] Hardware Series: ${summary}`);
+              console.log(`[SWEEP #${appState.scansCaptured}] ${summary}`);
             }
 
             if (appState.scanMode === 'SINGLE' && json.sweeping === false) {
-              console.log(`[SINGLE SWEEP] Captured sweep snapshot (${appState.scansCaptured} total). Auto-stopping scan.`);
+              console.log('[SINGLE SWEEP] Captured sweep snapshot. Auto-stopping scan.');
               appState.scanState = 'STOPPED';
               appState.status = 'SINGLE SWEEP COMPLETED (CONNECTED - READY)';
-              http.get('http://127.0.0.1:8088/sweep/stop', () => {}).on('error', () => {});
+              http.get(`http://127.0.0.1:${BRIDGE_PORT}/sweep/stop`, () => {}).on('error', () => {});
             }
           }
         } catch (e) {}
       });
     });
-    req.on('error', () => {});
+    req.setTimeout(5000, () => req.destroy());
+    req.on('error', () => { bridgePollInFlight = false; });
   }, 200);
 }
 
 function stop18EngineScan() {
   lastProcessedSweepId = -1;
   if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
-  appState.temperature = null;
+  appState.antennaBiasPending = {};
   if (engineProcess) {
     // SIGTERM is caught inside the Python bootstrap and triggers its atexit cleanup, which runs
     // eng.stop()'s graceful QUIT-FIRST teardown (releases the scan slot) before the process exits.
-    // No separate pkill needed here — the old one matched any process system-wide by bare script
-    // name rather than just this app's own child.
     try { engineProcess.kill('SIGTERM'); } catch (e) {}
     engineProcess = null;
   }
 }
 
 function initAcnSpectrumIngest() {
-  runDiscovery18();
+  runDiscovery();
+  // re-probe periodically so a device plugged in after launch still shows up
+  setInterval(() => { if (appState.connectionState === 'DISCONNECTED') runDiscovery(); }, 30000);
 }
 
 // Shared frequency-band <optgroup> markup for the display-zoom selector and every per-antenna /
@@ -678,7 +679,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Shure AD600 Node.js Spectrum Manager</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="/vendor/chart.umd.min.js"></script>
   <style>
     :root {
       --bg-dark: #0a0d14;
@@ -1127,38 +1128,24 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       background: rgba(255, 255, 255, 0.035);
     }
 
-    .device-temp-badge {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-muted);
-      padding-right: 2px;
-      transition: all 0.3s ease;
+    .bias-btn.pending {
+      outline: 1px dashed #ffaa00;
+      animation: bias-pending 0.8s ease-in-out infinite alternate;
     }
+    @keyframes bias-pending { from { opacity: 1; } to { opacity: 0.45; } }
 
-    .temp-icon {
-      color: #60a5fa;
-      display: inline-flex;
-      align-items: center;
-      gap: 3px;
-    }
-
-    .temp-value {
-      color: #f1f5f9;
-      font-variant-numeric: tabular-nums;
+    .view-only-badge {
+      display: none;
+      font-size: 10px;
       font-weight: 700;
+      letter-spacing: 0.04em;
+      color: #ffaa00;
+      border: 1px solid rgba(255, 170, 0, 0.4);
+      border-radius: 12px;
+      padding: 3px 8px;
     }
-
-    .temp-sep {
-      color: rgba(255, 255, 255, 0.2);
-    }
-
-    .temp-status {
-      color: #10b981;
-      font-weight: 700;
-    }
+    body.view-only .view-only-badge { display: inline-block; }
+    body.view-only .controls-panel { pointer-events: none; opacity: 0.55; }
 
     .diversity-row {
       display: flex;
@@ -1386,15 +1373,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         <div id="statusDot" class="status-dot"></div>
         <span id="statusText">DISCOVERING...</span>
       </div>
-      <div id="deviceTempContainer" class="device-temp-badge">
-        <span class="temp-icon">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
-          AD600 Internal:
-        </span>
-        <span id="tempValue" class="temp-value">-- °C (-- °F)</span>
-        <span class="temp-sep">•</span>
-        <span id="tempStatus" class="temp-status">STANDBY</span>
-      </div>
+      <span class="view-only-badge" title="Controls are limited to the host computer (AD600_REMOTE_CONTROL=0)">VIEW ONLY</span>
     </div>
   </div>
 
@@ -2004,6 +1983,17 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
     let needsTraceWipe = false;
     let targetConfigSeq = 0;
+    // Highest server config sequence this page has applied or produced. A higher one in /api/status
+    // means another viewer changed the shared setup, so this page reloads its cards from the server
+    // (otherwise its next change would push stale ranges for every antenna).
+    let knownConfigSeq = 0;
+    let localSyncPending = false;
+    function noteOwnConfigSeq(seq) {
+      if (seq) {
+        targetConfigSeq = seq;
+        knownConfigSeq = Math.max(knownConfigSeq, seq);
+      }
+    }
 
     function clearSpectrumDisplay(targetStartMhz, targetEndMhz) {
       needsTraceWipe = true;
@@ -2033,7 +2023,9 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     }
 
     let syncDebounceTimer = null;
-    function syncHardwareAndZoom(immediate = false) {
+    // push=false only redraws locally — used on page load so a newly opened viewer adopts the
+    // server's live configuration instead of re-arming the AD600 with this page's defaults.
+    function syncHardwareAndZoom(immediate = false, push = true) {
       updateCardActiveStyles();
       const active = getActiveAntennas();
       const [envStart, envEnd] = computeActiveEnvelope();
@@ -2054,12 +2046,15 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       }
 
       const doSync = async () => {
+        localSyncPending = true;
         try {
-          await fetch('/api/antenna', {
+          const aRes = await fetch('/api/antenna', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ antennas: active })
           });
+          const aJson = await aRes.json();
+          if (aJson) noteOwnConfigSeq(aJson.sweepConfigSeq);
         } catch (e) {}
 
         try {
@@ -2074,13 +2069,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             })
           });
           const json = await res.json();
-          if (json && json.sweepConfigSeq) {
-            targetConfigSeq = json.sweepConfigSeq;
-          }
+          if (json) noteOwnConfigSeq(json.sweepConfigSeq);
         } catch (e) {}
+        localSyncPending = false;
       };
 
       clearTimeout(syncDebounceTimer);
+      if (!push) return;
+      localSyncPending = true;
       if (immediate) {
         doSync();
       } else {
@@ -2596,9 +2592,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           body: JSON.stringify({ rbwHz: rbw })
         });
         const json = await res.json();
-        if (json && json.sweepConfigSeq) {
-          targetConfigSeq = json.sweepConfigSeq;
-        }
+        if (json) noteOwnConfigSeq(json.sweepConfigSeq);
       } catch (e) {
         console.error('RBW set error:', e);
       }
@@ -2955,23 +2949,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           statusEl.innerText = data.status || (isConnected ? 'CONNECTED' : 'DISCONNECTED');
         }
 
-        const tempValEl = document.getElementById('tempValue');
-        const tempStatusEl = document.getElementById('tempStatus');
-        if (isConnected && data.temperature) {
-          const c = typeof data.temperature.celsius === 'number' ? data.temperature.celsius.toFixed(1) : data.temperature.celsius;
-          const f = typeof data.temperature.fahrenheit === 'number' ? data.temperature.fahrenheit.toFixed(1) : data.temperature.fahrenheit;
-          if (tempValEl) tempValEl.innerText = c + ' °C (' + f + ' °F)';
-          if (tempStatusEl) {
-            const isWarn = Number(data.temperature.celsius) > 55;
-            tempStatusEl.innerText = data.temperature.status || (isWarn ? 'HIGH' : 'NORMAL');
-            tempStatusEl.style.color = isWarn ? '#ef4444' : '#10b981';
-          }
-        } else {
-          if (tempValEl) tempValEl.innerText = '-- °C (-- °F)';
-          if (tempStatusEl) {
-            tempStatusEl.innerText = isConnecting ? 'CONNECTING...' : 'DISCONNECTED';
-            tempStatusEl.style.color = isConnecting ? '#ffaa00' : '#94a3b8';
-          }
+        document.body.classList.toggle('view-only', data.controlAllowed === false);
+        if (!localSyncPending && (data.sweepConfigSeq || 0) > knownConfigSeq) {
+          applyServerConfig(data);
+          updateCardActiveStyles();
+          syncHardwareAndZoom(true, false);
         }
         document.getElementById('targetIp').innerText = data.activeTargetIp || '--.--.--.--';
         document.getElementById('antennaVal').innerText = (data.selectedAntennas || ['A']).join(', ');
@@ -3049,18 +3031,24 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         document.querySelectorAll('.ant-rename-btn').forEach(btn => {
           btn.disabled = !isConn;
           btn.classList.toggle('locked', !isConn);
-          btn.title = isConn ? 'Rename Antenna on Device' : 'Connect to AD600 to rename antenna';
+          btn.title = isConn ? 'Rename antenna (label shown in this app)' : 'Connect to AD600 to rename antenna';
         });
 
         // Sync Bias Buttons and channel lighting
         if (data.antennaBias) {
+          // A requested change shows as pending (pulsing) until the AD600 reports it back.
+          const pendingBias = data.antennaBiasPending || {};
+          const biasOf = ant => (pendingBias[ant] ? !!pendingBias[ant].enabled : !!data.antennaBias[ant]);
           ['A','B','C','D','E','F'].forEach(ant => {
             const bBtn = document.getElementById('biasBtn_' + ant);
             const card = document.getElementById('card_' + ant);
-            const isOn = !!data.antennaBias[ant];
+            const isOn = biasOf(ant);
             if (bBtn) {
               bBtn.classList.toggle('active', isOn);
-              bBtn.title = isOn ? 'Antenna ' + ant + ' Bias is ACTIVE (12V DC)' : 'Toggle Antenna ' + ant + ' Bias Power';
+              bBtn.classList.toggle('pending', !!pendingBias[ant]);
+              bBtn.title = pendingBias[ant]
+                ? 'Waiting for the AD600 to confirm Antenna ' + ant + ' bias ' + (isOn ? 'ON' : 'OFF')
+                : (isOn ? 'Antenna ' + ant + ' Bias is ACTIVE (12V DC)' : 'Toggle Antenna ' + ant + ' Bias Power');
             }
             if (card) {
               card.classList.toggle('bias-powered', isOn);
@@ -3071,10 +3059,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           for (const [pairKey, [ant1, ant2]] of Object.entries(DIVERSITY_PAIRS)) {
             const pairBtn = document.getElementById('biasBtn_' + pairKey);
             const pairCard = document.getElementById('card_' + pairKey);
-            const isPairOn = !!(data.antennaBias[ant1] && data.antennaBias[ant2]);
-            const isAnyOn = !!(data.antennaBias[ant1] || data.antennaBias[ant2]);
+            const isPairOn = biasOf(ant1) && biasOf(ant2);
+            const isAnyOn = biasOf(ant1) || biasOf(ant2);
             if (pairBtn) {
               pairBtn.classList.toggle('active', isPairOn);
+              pairBtn.classList.toggle('pending', !!(pendingBias[ant1] || pendingBias[ant2]));
               pairBtn.title = isPairOn ? ('Pair ' + pairKey + ' Bias is ACTIVE (12V DC)') : ('Toggle Pair ' + pairKey + ' Bias Power');
             }
             if (pairCard) {
@@ -3235,6 +3224,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             const [envStart, envEnd] = computeActiveEnvelope();
             const curTargetStart = (customZoomRange && !lockZoom) ? customZoomRange[0] : envStart;
             const curTargetEnd = (customZoomRange && !lockZoom) ? customZoomRange[1] : envEnd;
+            const hasRealData = chart.data.datasets && chart.data.datasets.some(d => d.data && d.data.length > 0 && !d.label.includes('Grid Baseline'));
             if (needsTraceWipe || !hasRealData) {
               chart.data.labels = buildBaselineLabels(curTargetStart, curTargetEnd);
               chart.options.scales.x.min = chart.data.labels[0];
@@ -3265,10 +3255,35 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       }
     }
 
-    window.addEventListener('DOMContentLoaded', () => {
+    // Adopt the server's current antenna selection and per-antenna ranges (shared by every viewer).
+    function applyServerConfig(data) {
+        const selected = (data.selectedAntennas && data.selectedAntennas.length) ? data.selectedAntennas : ['A'];
+        document.querySelectorAll('input[name="antennaCb"]').forEach(cb => {
+          cb.checked = selected.includes(cb.value);
+        });
+        const ranges = data.antennaRanges || {};
+        Object.keys(ranges).forEach(ant => {
+          const r = ranges[ant];
+          if (!Array.isArray(r) || r.length !== 2) return;
+          const presetKey = Object.keys(RANGE_PRESETS).find(k => RANGE_PRESETS[k][0] === r[0] && RANGE_PRESETS[k][1] === r[1]);
+          mirrorRangeToCard(ant, presetKey || 'CUSTOM', r[0], r[1]);
+        });
+        knownConfigSeq = Math.max(knownConfigSeq, data.sweepConfigSeq || 0);
+    }
+
+    async function hydrateFromServer() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) return;
+        applyServerConfig(await res.json());
+      } catch (e) {}
+    }
+
+    window.addEventListener('DOMContentLoaded', async () => {
       initChart();
+      await hydrateFromServer();
       updateCardActiveStyles();
-      syncHardwareAndZoom();
+      syncHardwareAndZoom(true, false);
 
       const cBtn = document.getElementById('connectBtn');
       if (cBtn) {
@@ -3292,12 +3307,41 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 </html>`;
 
 // 4. HTTP Web Server
+// Set AD600_REMOTE_CONTROL=0 to make every other device on the LAN view-only (only the host
+// computer can connect, change ranges, or switch antenna bias). Default keeps full remote control.
+const REMOTE_CONTROL = process.env.AD600_REMOTE_CONTROL !== '0';
+const CHART_JS_LOCAL = path.join(__dirname, 'vendor', 'chart.umd.min.js');
+const CHART_JS_CDN = 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js';
+
+function isLoopback(req) {
+  const a = (req.socket && req.socket.remoteAddress) || '';
+  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+}
+
 function startWebServer() {
   const server = http.createServer((req, res) => {
+    const urlPath = req.url.split('?')[0];
+    const controlAllowed = REMOTE_CONTROL || isLoopback(req);
+    if (req.method === 'POST' && urlPath.startsWith('/api/') && !controlAllowed) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'View-only: controls are limited to the host computer' }));
+      return;
+    }
     if (req.url === '/api/status' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      const payload = Object.assign({}, appState, { traces: antennaTraces });
+      const payload = Object.assign({}, appState, { traces: antennaTraces, controlAllowed });
       res.end(JSON.stringify(payload));
+    } else if (urlPath === '/vendor/chart.umd.min.js' && req.method === 'GET') {
+      // Served locally when vendored (works on a show network with no internet), else the CDN.
+      fs.readFile(CHART_JS_LOCAL, (err, data) => {
+        if (err) {
+          res.writeHead(302, { Location: CHART_JS_CDN });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'max-age=86400' });
+        res.end(data);
+      });
     } else if (req.url === '/api/connect' && req.method === 'POST') {
       let body = '';
       req.on('data', chunk => body += chunk);
@@ -3305,12 +3349,12 @@ function startWebServer() {
         try {
           const payload = JSON.parse(body);
           if (payload.action === 'connect') {
-            if (appState.connectionState !== 'CONNECTED') {
+            if (appState.connectionState === 'DISCONNECTED') {
               appState.connectionState = 'CONNECTING';
-              appState.status = `NEGOTIATING CONNECTION & OWNERSHIP TO AD600 @ ${appState.activeTargetIp || '169.254.244.206'}...`;
+              appState.status = `CONNECTING TO AD600 @ ${appState.activeTargetIp || '?'} (TAKES ~20-30 s)...`;
               start18EngineScan();
-            } else {
-              pollHardwareBias();
+            } else if (appState.connectionState === 'CONNECTED') {
+              requestBiasRefresh();
             }
           } else if (payload.action === 'disconnect') {
             appState.connectionState = 'DISCONNECTED';
@@ -3336,21 +3380,22 @@ function startWebServer() {
             lastProcessedSweepId = -1;
             antennaTraces = { A: [], B: [], C: [], D: [], E: [], F: [] };
             appState.traces = antennaTraces;
-            appState.status = appState.scanMode === 'SINGLE'
-              ? 'STARTING SINGLE SWEEP VIA 1.8 ENGINE...'
-              : 'STARTING CONTINUOUS SCAN VIA 1.8 ENGINE...';
             if (!engineProcess || appState.connectionState === 'DISCONNECTED') {
               appState.connectionState = 'CONNECTING';
+              appState.status = `CONNECTING TO AD600 @ ${appState.activeTargetIp || '?'} (FIRST SWEEP IN ~30 s)...`;
               start18EngineScan();
             } else {
-              http.get('http://127.0.0.1:8088/sweep/start', () => {}).on('error', () => {});
+              appState.status = appState.scanMode === 'SINGLE'
+                ? 'STARTING SINGLE SWEEP...'
+                : (appState.scanSlotOwned ? 'STARTING CONTINUOUS SCAN...' : 'WAITING FOR SCAN SLOT / FIRST SWEEP...');
+              http.get(`http://127.0.0.1:${BRIDGE_PORT}/sweep/start`, () => {}).on('error', () => {});
             }
           } else {
             appState.scanState = 'STOPPED';
             appState.scansCaptured = 0;
             lastProcessedSweepId = -1;
             appState.status = 'SCAN STOPPED (CONNECTED - READY)';
-            http.get('http://127.0.0.1:8088/sweep/stop', () => {}).on('error', () => {});
+            http.get(`http://127.0.0.1:${BRIDGE_PORT}/sweep/stop`, () => {}).on('error', () => {});
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, scanState: appState.scanState, scansCaptured: appState.scansCaptured }));
@@ -3411,7 +3456,7 @@ function startWebServer() {
             });
             const bridgeReq = http.request({
               hostname: '127.0.0.1',
-              port: 8088,
+              port: BRIDGE_PORT,
               path: '/configuration',
               method: 'POST',
               headers: {
@@ -3456,7 +3501,12 @@ function startWebServer() {
           // amplitudes (a decode bug in ad600_native.py's RF_SCAN_DATA parser, not a hardware
           // limit) — 50 kHz is the lowest RBW confirmed to stream clean data.
           const VALID_RBWS = [50000, 100000, 350000, 900000];
-          if (VALID_RBWS.includes(rbw)) {
+          if (!VALID_RBWS.includes(rbw)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: `Unsupported RBW; valid values: ${VALID_RBWS.join(', ')} Hz` }));
+            return;
+          }
+          {
             appState.rbwHz = rbw;
             appState.rbwComp = Math.max(2, Math.round(rbw / 25000));
             appState.sweepConfigSeq = (appState.sweepConfigSeq || 0) + 1;
@@ -3474,7 +3524,7 @@ function startWebServer() {
             const postData = JSON.stringify({ rbwHz: appState.rbwHz });
             const bridgeReq = http.request({
               hostname: '127.0.0.1',
-              port: 8088,
+              port: BRIDGE_PORT,
               path: '/configuration',
               method: 'POST',
               headers: {
@@ -3543,7 +3593,7 @@ function startWebServer() {
             const postData = JSON.stringify(configPayload);
             const bridgeReq = http.request({
               hostname: '127.0.0.1',
-              port: 8088,
+              port: BRIDGE_PORT,
               path: '/configuration',
               method: 'POST',
               headers: {
@@ -3582,7 +3632,7 @@ function startWebServer() {
             appState.selectedInterface = requested;
             appState.status = `PROBING INTERFACE ${requested}...`;
             console.log(`[NIC SELECTION] User selected interface ${requested}`);
-            runDiscovery18(requested);
+            runDiscovery(requested);
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, selectedInterface: appState.selectedInterface }));
@@ -3617,14 +3667,20 @@ function startWebServer() {
           const payload = JSON.parse(body);
           const ant = (payload.antenna || payload.port || 'A').toUpperCase();
           const enabled = !!payload.enabled;
+          if (appState.connectionState !== 'CONNECTED') {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'Not connected to the AD600' }));
+            return;
+          }
           if (appState.antennaBias && appState.antennaBias[ant] !== undefined) {
-            appState.antennaBias[ant] = enabled;
-            console.log(`[ANTENNA BIAS] Port ${ant} 12V DC Bias set to ${enabled ? 'ON' : 'OFF'}`);
+            // Not applied locally: the device's BIAS report confirms it (see antennaBiasPending).
+            appState.antennaBiasPending[ant] = { enabled, t: Date.now() };
+            console.log(`[ANTENNA BIAS] Requesting port ${ant} 12V DC bias ${enabled ? 'ON' : 'OFF'}`);
 
             const postData = JSON.stringify({ antenna: ant, enabled: enabled });
             const bridgeReq = http.request({
               hostname: '127.0.0.1',
-              port: 8088,
+              port: BRIDGE_PORT,
               path: '/bias',
               method: 'POST',
               headers: {
@@ -3637,7 +3693,7 @@ function startWebServer() {
             bridgeReq.end();
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, antennaBias: appState.antennaBias }));
+          res.end(JSON.stringify({ success: true, antennaBias: appState.antennaBias, antennaBiasPending: appState.antennaBiasPending }));
         } catch (e) {
           res.writeHead(400); res.end();
         }
@@ -3657,7 +3713,7 @@ function startWebServer() {
             const postData = JSON.stringify({ antenna: ant, name: name });
             const bridgeReq = http.request({
               hostname: '127.0.0.1',
-              port: 8088,
+              port: BRIDGE_PORT,
               path: '/antenna_name',
               method: 'POST',
               headers: {
@@ -3689,7 +3745,7 @@ function startWebServer() {
             const postData = JSON.stringify({ repeat: repeatVal });
             const bridgeReq = http.request({
               hostname: '127.0.0.1',
-              port: 8088,
+              port: BRIDGE_PORT,
               path: '/configuration',
               method: 'POST',
               headers: {
@@ -3707,19 +3763,26 @@ function startWebServer() {
           res.writeHead(400); res.end();
         }
       });
-    } else {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
+    } else if (urlPath.startsWith('/api/') || urlPath.startsWith('/vendor/')) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Not found' }));
+    } else if (req.method === 'GET' && (urlPath === '/' || urlPath === '/index.html')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(HTML_TEMPLATE);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
     }
   });
 
   server.listen(WEB_PORT, () => {
     console.log('===========================================================');
-    console.log('  Shure AD600 Node.js Spectrum App (470 MHz - 1.0 GHz)      ');
+    console.log('  Shure AD600 Web Spectrum Scanner');
     console.log('===========================================================');
     console.log(`  [+] Web Dashboard : http://localhost:${WEB_PORT}`);
-    console.log(`  [+] Range Span    : 470.0 MHz - 1000.0 MHz (1.0 GHz)`);
-    console.log(`  [+] Controls      : Radio Buttons (ALL, Antenna A, B, C, D, E, F)`);
+    console.log(`  [+] LAN control   : ${REMOTE_CONTROL ? 'enabled' : 'VIEW-ONLY for other devices (AD600_REMOTE_CONTROL=0)'}`);
+    console.log(`  [+] Chart library : ${fs.existsSync(CHART_JS_LOCAL) ? 'local (offline-capable)' : 'CDN (needs internet - see README)'}`);
+    console.log(`  [+] Engine logs   : ${path.join(SCRATCH_DIR, 'console_out.log')}`);
     console.log('===========================================================');
   });
 }

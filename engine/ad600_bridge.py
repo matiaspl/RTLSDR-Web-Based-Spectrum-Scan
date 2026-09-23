@@ -24,12 +24,19 @@ Stdlib only. Import and drive via feed()/start()/stop(), or run standalone for a
     python3 ad600_bridge.py --selftest
 """
 import os, sys, json, time, threading, struct, base64
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from paths import scratch_dir
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ── the ONE fixed physical constant: the channel plan (25 kHz per freq_idx, base 174 MHz) ──
 FREQ_BASE_KHZ = 174000            # freq_idx 0 == 174.000 MHz
 IDX_KHZ       = 25                # 25 kHz per freq_idx step  (freq_MHz = 174 + idx*0.025)
 FLOOR_DBM     = -130.0            # amplitude floor for grid points with no sample
+# No legitimate AD600 RF reading is above this — a value past it is a decode artifact (an
+# occasional corrupted RF_SCAN_DATA frame reads as a wildly out-of-range int16, e.g. 2253.0 or
+# 1459.4 dBm; see AD600_Reverse_Engineering_Findings.md §6.3). Such samples are dropped at ingest
+# so they can never reach the trace or latch into a max-hold accumulator.
+SANE_CEILING_DBM = 20.0
 
 # ── delivered RBW = REAL_TIME_COMPRESSION * 25 kHz ──
 # Standard RBW reference set so the user picks from standard analyzer values. Whatever they
@@ -49,7 +56,7 @@ SUPPORTED_RBW_HZ = [50000, 100000, 350000, 900000]
 
 
 def rbw_hz_to_comp(rbw_hz):
-    """Requested rbwHz → REAL_TIME_COMPRESSION, clamped to the validated streamable [350k,900k]."""
+    """Requested rbwHz → REAL_TIME_COMPRESSION, clamped to the validated streamable [50k,900k]."""
     try:
         comp = int(round(float(rbw_hz) / (IDX_KHZ * 1000.0)))
     except Exception:
@@ -127,7 +134,7 @@ def _default_scan_config(grid):
         "scan_stop_freq_khz":  idx_to_khz(grid.hi),   # SCAN_STOP_FREQ   (uint32 kHz)
         "scan_step_idx":       grid.step,             # decimation / bins-per-sample stride
         "res_bw_khz":          grid.step * IDX_KHZ,   # resolution bandwidth
-        "repeat":              1,                     # continuous
+        "repeat":              0xFF,                  # 0xFF = continuous, 1 = single-shot
         "curve_select":        0,                     # 0 = all antennas
         "sweep_rate":          0,                     # device default
         "rt_compression":      grid.step,             # COMP stride reported per frame
@@ -168,9 +175,11 @@ class Bridge:
 
         # ── per-antenna assembly (grid-agnostic: absolute freq_idx -> dBm) ──
         self.building = {}                     # ant -> {freq_idx: dbm}
-        self.latest = {}                       # ant -> {freq_idx: dbm} (last completed sweep)
-        self.last_flo = {}                     # ant -> last frame's flo (restart detection)
-        self.cycle = set()
+        self.latest = {}                       # ant -> {freq_idx: dbm}, mirrors `building` once covered
+        self.seen_lo = {}                      # ant -> has a frame touched grid.lo since the last reset?
+        self.seen_hi = {}                      # ant -> has a frame touched grid.hi since the last reset?
+        self.sweep_count = 0                   # completed passes over the configured band
+        self._single_done = False              # single-shot (repeat==1) pass already completed
 
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
@@ -197,87 +206,123 @@ class Bridge:
             self.learned_top = None
             self.building.clear()
             self.latest.clear()
-            self.last_flo.clear()
-            self.cycle.clear()
+            self.seen_lo.clear()
+            self.seen_hi.clear()
+            self.sweep_count = 0
+            self._single_done = False
             self.trace = None
             self.sweep_id = 0
             self._reset_accum()
 
     def _observed_grid(self):
-        if self.obs_lo is None or self.learned_top is None or not self.obs_step:
+        top = self.learned_top if self.learned_top is not None else self.obs_hi
+        if self.obs_lo is None or top is None or not self.obs_step:
             return None
-        return Grid(self.obs_lo, self.learned_top, self.obs_step)
+        return Grid(self.obs_lo, top, self.obs_step)
 
     def effective_grid(self):
+        if self.scan_config.get("_range_from_config"):
+            start_khz = int(self.scan_config.get("scan_start_freq_khz") or 0)
+            stop_khz = int(self.scan_config.get("scan_stop_freq_khz") or 0)
+            if start_khz and stop_khz:
+                # The configured range is authoritative (not whatever tiles have arrived so far), and
+                # so is the EXACT compression we told the device to use — a boundary/short frame's own
+                # (fhi-flo)/(n-1) can round to a different stride, and re-gridding every stored point
+                # on a per-frame stride makes points blip out of range (findings §6.4).
+                step = self.scan_config.get("req_rt_compression") or self.obs_step or 1
+                lo, hi = khz_to_idx(start_khz), khz_to_idx(stop_khz)
+                # The device streams floor(span/step) samples starting at the start frequency and
+                # never includes the stop (verified live: 470-524 MHz @ 350 kHz -> 154 samples,
+                # @ 100 kHz -> 540; 470-616 MHz @ 100 kHz -> 1460, ending at 615.9). Predicting
+                # that keeps the grid size fixed from the first tile instead of shrinking by one
+                # bin when the top tile finally arrives. An observed top beyond the prediction
+                # (never seen so far) still wins, capped at the requested stop.
+                n = max(1, (hi - lo) // step)
+                top = lo + (n - 1) * step
+                if self.learned_top is not None and top < self.learned_top <= hi:
+                    top = self.learned_top
+                return Grid(lo, top, step)
         return self._observed_grid() or self.seed_grid
 
     # ───────────────────────────────── frame ingestion ─────────────────────────────────
     def feed(self, curve, flo, fhi, amps):
-        """Called per decoded FRAME. Grid-agnostic ingest; publishes a merged trace per sweep."""
+        """Called per decoded FRAME (one tile of one antenna's sweep). See findings §6.2."""
         with self._cv:
             n = len(amps)
             if n <= 0:
                 return
-            stride = int(round((fhi - flo) / (n - 1))) if n > 1 else (self.obs_step or SEED_STEP)
-            if stride <= 0:
-                stride = self.obs_step or SEED_STEP
-            # update observed extents/stride
+            # The compression we requested is authoritative for storage indexing (findings §6.4);
+            # only a bare session with no requested compression falls back to the frame's own stride.
+            known_comp = self.scan_config.get("req_rt_compression")
+            if known_comp:
+                stride = int(known_comp)
+            else:
+                stride = int(round((fhi - flo) / (n - 1))) if n > 1 else (self.obs_step or SEED_STEP)
+                if stride <= 0:
+                    stride = self.obs_step or SEED_STEP
             self.obs_lo = flo if self.obs_lo is None else min(self.obs_lo, flo)
             self.obs_hi = fhi if self.obs_hi is None else max(self.obs_hi, fhi)
-            self.obs_step = stride                    # frames within a config are uniform
+            self.obs_step = stride
+            self.learned_top = fhi if self.learned_top is None else max(self.learned_top, fhi)
             ant = int(curve)
 
-            # restart detection: this antenna's frame wrapped back to (or below) its previous flo
-            if ant in self.building and flo <= self.last_flo.get(ant, 1 << 30):
-                self._finalize(ant)
-
+            # Never cleared mid-sweep: keys are absolute freq_idx, so a re-sample of a frequency
+            # overwrites its own entry and each tile refreshes only its own slice. Corrupted
+            # samples (§6.3) are skipped, leaving the previous good value in place.
             d = self.building.setdefault(ant, {})
             for k, a in enumerate(amps):
-                d[flo + k * stride] = a
-            self.last_flo[ant] = flo
+                if FLOOR_DBM < a <= SANE_CEILING_DBM:
+                    d[flo + k * stride] = a
 
-            # top reached: only finalize if we reached the true target stop frequency
-            stop_khz = self.scan_config.get("scan_stop_freq_khz")
-            if stop_khz:
-                target_top_idx = khz_to_idx(stop_khz)
-                if fhi >= target_top_idx - (self.obs_step or SEED_STEP):
-                    self._finalize(ant)
-            elif self.learned_top is not None and fhi >= self.learned_top:
-                self._finalize(ant)
-
-            # stats
+            now = time.time()
             self.frames_total += 1
             self.frames_window += 1
-            self.last_frame_t = time.time()
-            dt = self.last_frame_t - self._win_t0
+            self.last_frame_t = now
+            dt = now - self._win_t0
             if dt >= 1.0:
                 self.pkts_per_s = self.frames_window / dt
                 self.frames_window = 0
-                self._win_t0 = self.last_frame_t
+                self._win_t0 = now
 
-    def _finalize(self, ant):
-        """Move an antenna's building buffer to `latest`; learn band top; publish once per cycle."""
-        buf = self.building.pop(ant, None)
-        self.last_flo.pop(ant, None)
-        if not buf:
-            return
-        top = max(buf.keys())
-        self.learned_top = top if self.learned_top is None else max(self.learned_top, top)
-        if ant not in self.latest:
-            self.latest[ant] = {}
-        # Persistent Phosphor: Update in-place so un-scanned or dropped bins retain previous values
-        self.latest[ant].update(buf)
-        if ant in self.cycle:
+            # Coverage tracking, not "sweep completion" (findings §6.2): a wide span at a fine RBW
+            # streams as several tiles per antenna arriving at very uneven intervals (live: the top
+            # tile of 470-616 MHz @ 100 kHz first arrived ~60 s after the low one). Every frame
+            # republishes the accumulated picture on the fixed configured grid, flagged
+            # `coverageComplete: false` until each antenna has touched BOTH edges at least once, so
+            # the operator sees the band fill in rather than a blank plot or a partial one
+            # presented as complete.
+            grid = self.effective_grid()
+            touched_hi = fhi >= grid.hi - (stride * 2)
+            was_covered = bool(self.seen_lo.get(ant) and self.seen_hi.get(ant))
+            if flo <= grid.lo + (stride * 5):
+                self.seen_lo[ant] = True
+            if touched_hi:
+                self.seen_hi[ant] = True
+            if not d:
+                return
+            self.latest[ant] = dict(d)
+            if not (self.seen_lo.get(ant) and self.seen_hi.get(ant)):
+                self._publish()
+                return
+            # Counts passes of the lowest-numbered antenna: the moment its band first becomes fully
+            # covered, then each later top-edge tile — so it tracks sweeps, not frames or antennas.
+            if ant == min(self.latest) and (touched_hi or not was_covered):
+                self.sweep_count += 1
+            if self.scan_config.get("repeat") == 1 and not self._single_done:
+                expected = self._expected_antennas()
+                if expected and all(self.seen_lo.get(a) and self.seen_hi.get(a) for a in expected):
+                    self._single_done = True
+                    self.sweeping = False
             self._publish()
-            self.cycle.clear()
-            if self.scan_config.get("repeat") == 1:
-                # Caller (feed()) already holds self._lock via self._cv — self._lock is a plain
-                # (non-reentrant) Lock, so re-acquiring it here would deadlock this thread forever.
-                self.sweeping = False
-        self.cycle.add(ant)
+
+    def _expected_antennas(self):
+        """Antenna curves (1..6) the device was asked to stream, from the CURVE_SELECT mask."""
+        mask = int(self.scan_config.get("curve_select") or 0) or 0x7E
+        return [a for a in range(1, 7) if mask & (1 << a)]
 
     def _clean(self, arr):
-        return [round((v if v > FLOOR_DBM else FLOOR_DBM) * 10) / 10 for v in arr]
+        return [round((v if FLOOR_DBM < v <= SANE_CEILING_DBM else FLOOR_DBM) * 10) / 10
+                for v in arr]
 
     def _reset_accum(self):
         """Clear all traceMode accumulators — called on a mode change or a fresh sweep start so a
@@ -355,10 +400,13 @@ class Bridge:
             out = [s / self._avg_n for s in self._avg_sum]
         # ── VBW: SOFTWARE video-bandwidth smoothing (the AD600 has no hardware VBW) ──
         out = self._apply_vbw(out)
+        filled = sum(1 for v in merged if v > FLOOR_DBM)
+        complete = bool(ants) and all(self.seen_lo.get(a) and self.seen_hi.get(a) for a in ants)
         self.sweep_id += 1
         self.trace = {
             "startHz": grid.start_hz, "stopHz": grid.stop_hz, "stepHz": grid.step_hz,
-            "pointCount": N, "sweepId": self.sweep_id,
+            "pointCount": N, "sweepId": self.sweep_id, "sweepCount": self.sweep_count,
+            "coverageComplete": complete, "coveragePct": int(100 * filled / N) if N else 0,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
             "unit": "dBm", "amplitudesDbm": self._clean(out), "series": series,
             "sweeping": self.sweeping,
@@ -507,6 +555,11 @@ class Bridge:
     def sweep_start(self):
         with self._lock:
             self.sweeping = True
+            self._single_done = False
+            if self.scan_config.get("repeat") == 1:
+                # a new single-shot pass must re-cover the band before it counts as done
+                self.seen_lo.clear()
+                self.seen_hi.clear()
             self.sweep_id = 0
             self._reset_accum()        # a fresh sweep starts a clean max/min/average accumulation
         if callable(self.on_start):
@@ -594,18 +647,21 @@ class Bridge:
                     return self._json(200, bridge.sweep_stop())
                 if path == "/bias":
                     b = self._body()
-                    ant = str(b.get("antenna", "A")).upper()
+                    ant = str(b.get("antenna", "")).upper()
+                    if len(ant) != 1 or not ('A' <= ant <= 'F'):
+                        return self._json(400, {"error": "antenna must be A-F"})
                     enabled = bool(b.get("enabled", False))
-                    idx = ord(ant) - ord('A') if ('A' <= ant <= 'F') else 0
-                    bridge.antenna_bias[ant] = enabled
-                    cmd_dir = os.environ.get("AD600_ENGINE_SCRATCH") or os.path.join(os.path.expanduser("~"), ".ad600_scanner")
+                    idx = ord(ant) - ord('A')
+                    # antenna_bias is NOT updated here — only the device's own BIAS report (via
+                    # the engine) changes it, so a lost or refused SET can't show as applied.
+                    cmd_dir = scratch_dir()
                     try:
-                        os.makedirs(cmd_dir, exist_ok=True)
                         # Shared with Engine._run_once(), which truncates this same file on every
                         # (re)arm — without this lock a bias command written mid-truncate is lost.
                         with bridge.cmdfile_lock, open(os.path.join(cmd_dir, "console_cmd.txt"), "a") as f:
                             f.write("set 0107047%d %s\n" % (idx, "01" if enabled else "00"))
-                        return self._json(200, {"antenna": ant, "enabled": enabled, "status": "ok"})
+                            f.write("get 0107047%d\n" % idx)   # read back → BIAS telemetry line
+                        return self._json(200, {"antenna": ant, "requested": enabled, "status": "pending"})
                     except Exception as e:
                         return self._json(500, {"error": str(e)})
                 if path == "/antenna_name":
@@ -709,6 +765,55 @@ def _selftest():
     check("POST /configuration mapped range → scan_config SCAN_START_FREQ",
           caught.get("scan_start_freq_khz") == idx_to_khz(21000))
     b2.shutdown()
+
+    # 3) MULTI-TILE, UNEVEN ARRIVAL (findings §6.2): 470-616 MHz @ 100 kHz streams as three tiles
+    # per antenna, the top one arriving far less often. (a) a frame touching one edge alone must not
+    # count as covered; (b) once covered, a repeat low tile must not blank the higher tiles.
+    b3 = Bridge(port=0)
+    b3.apply_configuration({"startHz": freq_hz(0), "stopHz": freq_hz(3000), "rbwHz": 100000})
+
+    def feed_tile(lo, hi, level, bridge=b3):
+        bridge.feed(1, lo, hi, [level] * ((hi - lo) // 4 + 1))
+
+    for _ in range(3):
+        feed_tile(0, 1200, -60.0)
+    feed_tile(1200, 2400, -70.0)
+    tr0 = b3.trace or {}
+    check("multi-tile: partial trace flagged incomplete before both edges are covered",
+          tr0.get("coverageComplete") is False and 0 < tr0.get("coveragePct", 0) < 100
+          and tr0.get("pointCount") == 750 and tr0["amplitudesDbm"][-1] <= FLOOR_DBM)
+    feed_tile(2400, 2996, -50.0)
+    amps = (b3.trace or {}).get("amplitudesDbm") or []
+    check("multi-tile: grid spans the configured range (floor(span/step) samples)", len(amps) == 750)
+    check("multi-tile: flagged complete once every tile has arrived",
+          b3.trace.get("coverageComplete") is True and b3.trace.get("coveragePct") == 100)
+    check("multi-tile: all three tiles present once covered",
+          len(amps) > 0 and amps[0] > -125 and amps[len(amps) // 2] > -125 and amps[-1] > -125)
+    feed_tile(0, 1200, -61.0)
+    amps2 = (b3.trace or {}).get("amplitudesDbm") or []
+    check("multi-tile: a repeat low tile doesn't erase the high tiles",
+          len(amps2) > 0 and abs(amps2[0] + 61.0) < 0.05 and abs(amps2[-1] + 50.0) < 0.05)
+
+    # 4) CORRUPTED FRAME (findings §6.3): a physically impossible amplitude is dropped at ingest
+    # and can never latch into max-hold.
+    b3.apply_configuration({"traceMode": "max-hold"})
+    feed_tile(0, 1200, 2253.0)
+    feed_tile(2400, 2996, -50.0)
+    amps3 = (b3.trace or {}).get("amplitudesDbm") or []
+    check("corrupted frame: nothing above the sane ceiling reaches the trace",
+          len(amps3) > 0 and max(amps3) <= SANE_CEILING_DBM and abs(amps3[0] + 61.0) < 0.05)
+    s3 = [x for x in b3.trace["series"] if x["name"] == "A"][0]["amplitudesDbm"]
+    check("corrupted frame: per-antenna series also clean", max(s3) <= SANE_CEILING_DBM)
+
+    # 5) SINGLE-SHOT: repeat=1 with only antenna A selected stops once A has covered the band.
+    b4 = Bridge(port=0)
+    b4.apply_configuration({"startHz": freq_hz(0), "stopHz": freq_hz(3000), "rbwHz": 100000,
+                            "curveMask": 0x02, "repeat": 1})
+    b4.sweep_start()
+    feed_tile(0, 1500, -60.0, b4)
+    check("single-shot: still sweeping mid-pass", b4.sweeping is True)
+    feed_tile(1500, 3000, -60.0, b4)
+    check("single-shot: stops after one covered pass", b4.sweeping is False and b4.sweep_count == 1)
 
     print("\nSELFTEST:", "ALL PASS" if ok else "FAILURES")
     return 0 if ok else 1

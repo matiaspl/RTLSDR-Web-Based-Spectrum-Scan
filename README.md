@@ -47,13 +47,9 @@ It serves an interactive, low-latency dashboard accessible from any web browser 
 * **Diversity Pair Coupling**: Group paired antennas (`A+B`, `C+D`, `E+F`) into unified interface cards locked to matching frequency windows.
 * **Intelligent Sweep Optimization**: The engine automatically computes the tightest bounding frequency envelope across all active inputs and configures the hardware oscillator to sweep only that window. Sweeping a 150 MHz span (e.g. 470–620 MHz) is **~3.5x faster** than scanning all of UHF.
 
-### 12V DC Antenna Bias Power & Telemetry
-* **Live Status Polling**: Instantly reads the active hardware 12V DC bias state across all antenna inputs (A–F) upon network connection.
-* **Remote Toggle**: Turn antenna DC bias power on or off directly from the browser interface with immediate hardware verification.
-
-### Hardware Health & Environmental Monitoring
-* **Internal Temperature**: Continuous live temperature telemetry in both Celsius and Fahrenheit (°C and °F).
-* **Cooling Fan State**: Real-time monitoring of internal chassis cooling and thermal health.
+### 12V DC Antenna Bias Power
+* **Live Status**: Reads the 12V DC bias state of all antenna inputs (A–F) on connection and subscribes to changes, so bias switched elsewhere (front panel, WWB) shows up too.
+* **Hardware-Confirmed Toggle**: Turn antenna DC bias on or off from the browser. The button pulses until the AD600 reports the new state back; if the device doesn't confirm within a few seconds, the status bar says so.
 
 ### Interactive DTV Station Masks
 * **US & UK Standards**: Toggle between **US ATSC (6 MHz channels)** and **UK DVB-T/T2 (8 MHz channels)** channel grids.
@@ -81,6 +77,14 @@ In Safari on your iPad:
 1. Tap the **Share** button (the square with an arrow pointing up).
 2. Tap **Add to Home Screen**.
 3. Launch the app from your home screen icon to enjoy a borderless, full-screen wireless spectrum analyzer.
+
+---
+
+## Connecting
+
+Connecting takes **about 20–30 seconds** — the AD600 needs a paced session handshake and a scan-slot claim before the first sweep arrives. The status bar shows each stage (announcing → joining → claiming scan slot → first sweep).
+
+Only one controller can own the AD600's scan slot at a time. Close **Wireless Workbench** (and SoundBase's AD600 plugin, if it's scanning) before connecting; otherwise the status bar reports that the slot is held by another controller.
 
 ---
 
@@ -121,20 +125,35 @@ Open **`http://localhost:8080`** in your web browser.
 ## Network Configuration
 
 * **Direct Ethernet Connection**: Set your computer's network interface to Link-Local / DHCP (typically `169.254.x.x`) to connect directly to the AD600's primary network port.
-* **Network Discovery (SLP)**: The app listens on UDP port `57383` and standard Service Location Protocol (SLP) multicast (`239.255.255.253`) to auto-detect AD600 devices.
-* **Firewall Ports**: Ensure your computer's local firewall permits:
-  * TCP port `8080` (Inbound HTTP Web Dashboard)
-  * UDP port `57383` (Inbound Shure Discovery & Device Telemetry traffic)
+* **Interface Selection**: Leave the interface on *All* and the app picks the network interface whose subnet actually contains the AD600, whatever your adapters are called.
+* **Network Discovery (SLP)**: The app finds AD600s with Shure's SLP adverts on multicast `239.255.254.253`, UDP port `8427`.
+* **Session Traffic**: The AD600's control session lives on UDP port `57383` *on the device*; the device streams scan data back to a random (ephemeral) UDP port on this computer.
+* **Firewall**: Allow incoming TCP `8080` (dashboard for other devices) and incoming UDP for Python (discovery adverts on `8427` and the device's scan stream). On macOS, answer *Allow* when asked about incoming connections for `node` and `python3`.
+
+## Offline Use (No Internet at the Venue)
+
+The dashboard is fully self-contained: the chart library ([Chart.js](https://www.chartjs.org/) v4, MIT) ships in `vendor/chart.umd.min.js` and is served by the app, so it works on a closed show network or a direct link-local cable with no internet. (If that file is ever removed, browsers fall back to the jsDelivr CDN.)
+
+## Control Access
+
+By default every browser on the network can use the controls (connect, ranges, RBW, antenna bias). To make other devices **view-only** — they still see the live spectrum — start the server with:
+
+```bash
+AD600_REMOTE_CONTROL=0 node server.js
+```
+
+Controls then work only from the computer running the server.
 
 ---
 
 ## Architecture & Code Structure
 
-* `server.js`: Node.js web server, REST API router (`/api/status`, `/api/range`, `/api/bias`, `/api/antenna`, `/api/connect`), and unified single-page HTML5/Canvas dashboard.
+* `server.js`: Node.js web server, REST API router (`/api/status`, `/api/connect`, `/api/scan`, `/api/range`, `/api/rbw`, `/api/antenna`, `/api/bias`, `/api/iface`, `/api/target`, `/api/scan_mode`, `/api/antenna_name`), and the single-page dashboard.
 * `engine/ad600_console.py`: Core hardware communications engine managing network sessions, embedded scan initialization, parameter control, and real-time hardware telemetry emission.
 * `engine/ad600_bridge.py`: Local bridge engine interfacing the console process with the web server.
 * `engine/ad600_native.py`: Low-level protocol framing, packet codecs, and data stream parsers.
-* `engine/ad600_discovery.py`: Network interface enumeration and controller CID derivation.
+* `engine/ad600_discovery.py`: SLP device discovery, network interface enumeration, and subnet-based interface matching.
+* Engine logs and the console command file live in `~/.ad600_node_app/` (`console_out.log`, rotated at 20 MB).
 * `start_mac.command`: macOS first-launch shell script with Node.js prerequisite checks.
 * `start_windows.bat`: Windows first-launch batch script with automatic `winget` installation support.
 

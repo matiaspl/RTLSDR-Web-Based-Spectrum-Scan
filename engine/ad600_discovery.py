@@ -19,7 +19,7 @@ We PULL device_cid / device_ip / device_port / model straight from that advert �
 
 Stdlib only. Runs as a CLI too:   python3 ad600_discovery.py [--iface en10] [--timeout 6] [--all]
 """
-import os, re, sys, socket, struct, subprocess, time
+import ipaddress, os, re, sys, socket, struct, subprocess, time
 
 SLP_GROUP = "239.255.254.253"
 SLP_PORT  = 8427
@@ -46,8 +46,9 @@ def derive_our_cid(mac):
 # Interface enumeration (stdlib-first; netifaces optional)
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 def list_interfaces():
-    """Return [{name, mac, ipv4}] for the machine's NICs. Only IPv4-capable, non-loopback NICs
-    with a MAC (so a CID can be derived) are returned. netifaces used if importable, else ifconfig."""
+    """Return [{name, mac, ipv4, netmask}] for the machine's NICs. Only IPv4-capable, non-loopback
+    NICs with a MAC (so a CID can be derived) are returned. netifaces used if importable, else
+    ifconfig. `netmask` is a dotted-decimal string when known, else ''."""
     try:
         import netifaces  # type: ignore
         return _list_interfaces_netifaces(netifaces)
@@ -62,9 +63,11 @@ def _list_interfaces_netifaces(netifaces):
             continue
         addrs = netifaces.ifaddresses(name)
         mac = (addrs.get(netifaces.AF_LINK, [{}])[0] or {}).get("addr", "")
-        ip4 = (addrs.get(netifaces.AF_INET, [{}])[0] or {}).get("addr", "")
+        inet = (addrs.get(netifaces.AF_INET, [{}])[0] or {})
+        ip4 = inet.get("addr", "")
+        netmask = inet.get("netmask", "")
         if mac:
-            out.append({"name": name, "mac": mac, "ipv4": ip4 or ""})
+            out.append({"name": name, "mac": mac, "ipv4": ip4 or "", "netmask": netmask or ""})
     return out
 
 
@@ -81,7 +84,7 @@ def _list_interfaces_ifconfig():
             if name == "lo0":
                 cur = None
                 continue
-            cur = {"name": name, "mac": "", "ipv4": ""}
+            cur = {"name": name, "mac": "", "ipv4": "", "netmask": ""}
             out.append(cur)
             continue
         if cur is None:
@@ -91,6 +94,11 @@ def _list_interfaces_ifconfig():
         if m:
             cur["mac"] = m.group(1)
             continue
+        m = re.match(r"inet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]+)", s)
+        if m and not cur["ipv4"]:
+            cur["ipv4"] = m.group(1)
+            cur["netmask"] = _hexmask_to_dotted(m.group(2))
+            continue
         m = re.match(r"inet\s+(\d+\.\d+\.\d+\.\d+)", s)
         if m and not cur["ipv4"]:
             cur["ipv4"] = m.group(1)
@@ -98,10 +106,19 @@ def _list_interfaces_ifconfig():
     return [d for d in out if d["mac"]]
 
 
+def _hexmask_to_dotted(hexmask):
+    """'0xffff0000' -> '255.255.0.0'."""
+    try:
+        v = int(hexmask, 16)
+        return "%d.%d.%d.%d" % ((v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+    except Exception:
+        return ""
+
+
 def _list_interfaces_socket_only():
     """Last-resort: at least report the primary interface's IP (no MAC/name detail)."""
     ip = _primary_ipv4()
-    return [{"name": "default", "mac": "", "ipv4": ip}] if ip else []
+    return [{"name": "default", "mac": "", "ipv4": ip, "netmask": ""}] if ip else []
 
 
 def _primary_ipv4():
@@ -119,6 +136,28 @@ def iface_by_name(name):
     for d in list_interfaces():
         if d["name"] == name:
             return d
+    return None
+
+
+def iface_for_host(host):
+    """Which of this machine's interfaces shares a subnet with `host`, using each interface's
+    REAL netmask (not a hardcoded prefix guess) — works for a link-local direct connection
+    (169.254.0.0/16) exactly as well as an ordinary DHCP LAN. Returns an interface record dict,
+    or None if no interface's subnet contains the host (caller should not guess further)."""
+    try:
+        target = ipaddress.ip_address(host)
+    except Exception:
+        return None
+    for ifd in list_interfaces():
+        ip4, mask = ifd.get("ipv4"), ifd.get("netmask")
+        if not ip4 or not mask:
+            continue
+        try:
+            net = ipaddress.ip_network(f"{ip4}/{mask}", strict=False)
+        except Exception:
+            continue
+        if target in net:
+            return ifd
     return None
 
 
