@@ -1,11 +1,11 @@
 @echo off
 setlocal enabledelayedexpansion
 
-title Shure AD600 Spectrum Manager Web Dashboard Launcher
+title RTL-SDR Web Spectrum Scanner Launcher
 
 echo.
 echo ==================================================================
-echo    Shure AD600 Spectrum Manager Web Dashboard Launcher
+echo    RTL-SDR Web Spectrum Scanner Launcher
 echo ==================================================================
 echo.
 
@@ -59,7 +59,7 @@ echo.
 start "" /b cmd /c "timeout /t 2 /nobreak >nul & start http://localhost:8080"
 
 :: 4. Start the Node.js application server
-echo Starting AD600 Web Spectrum Application...
+echo Starting RTL-SDR Web Spectrum Application...
 echo Access on this PC:  http://localhost:8080
 echo Access on iPad/LAN: http://^<Your-PC-IP^>:8080
 echo.

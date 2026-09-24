@@ -1,23 +1,39 @@
 const http = require('http');
 const dgram = require('dgram');
 const os = require('os');
+const crypto = require('crypto');
 
-const WEB_PORT = 8080;
+const WEB_PORT = 8000;
 const SLP_PORT = 8427;
 const SLP_MULTICAST_ADDR = '239.255.254.253';
+const RTL_TCP_HOST = process.env.RTL_TCP_HOST || '127.0.0.1';
+const RTL_TCP_PORT = Number.parseInt(process.env.RTL_TCP_PORT || '1234', 10);
 
 // App State
 let appState = {
   interfaces: [], // list of { name, address }
   selectedInterface: 'ALL', // 'ALL' = auto: pick the NIC whose subnet contains the device
-  discoveredDevices: {}, // ip -> { ip, model, cid, iface, sdtPort, lastSeen }
-  activeTargetIp: null,
-  activeTargetModel: 'Shure AD600 Spectrum Manager',
-  activeTargetSdtPort: 57383,
+  discoveredDevices: {
+    [RTL_TCP_HOST]: { ip: RTL_TCP_HOST, model: 'RTL-SDR (rtl_tcp)', iface: 'network', lastSeen: Date.now() }
+  },
+  activeTargetIp: RTL_TCP_HOST,
+  activeTargetModel: 'RTL-SDR (rtl_tcp)',
+  activeTargetSdtPort: RTL_TCP_PORT,
   connectionState: 'DISCONNECTED', // 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED'
   selectedAntennas: ['A'], // Array of selected antennas, e.g. ['A', 'B']
+  inputLabel: 'RTL-SDR',
+  rtlClients: [{
+    id: 'rtl-client-1',
+    name: 'RTL-SDR',
+    host: RTL_TCP_HOST,
+    port: RTL_TCP_PORT,
+    startMhz: 470.0,
+    stopMhz: 524.0,
+    enabled: false,
+    state: 'DISCONNECTED'
+  }],
   scanState: 'STOPPED', // 'STOPPED' | 'SCANNING'
-  status: 'DISCONNECTED - SELECT DEVICE & CLICK CONNECT',
+  status: 'DISCONNECTED - RTL-SDR NODE READY',
   scansCaptured: 0,
   lastScanTime: null,
   startFreqMhz: 470.0,
@@ -42,7 +58,7 @@ let appState = {
   antennaBiasPending: {}, // ant -> { enabled, t } awaiting device confirmation
   scanSlotOwned: false,
   antennaNames: {
-    'A': '',
+    'A': 'Shared Scan Range',
     'B': '',
     'C': '',
     'D': '',
@@ -114,7 +130,7 @@ function ifaceForHost(ip) {
 }
 
 // 2. 1.8 Engine Process Manager & Multi-Antenna Trace Aggregator
-const { spawn, exec, execSync, execFile } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -123,11 +139,12 @@ const ENGINE_DIR = path.join(__dirname, 'engine');
 // which the SoundBase AD600 plugin also uses.
 const SCRATCH_DIR = process.env.AD600_ENGINE_SCRATCH || path.join(os.homedir(), '.ad600_node_app');
 const CMD_FILE = path.join(SCRATCH_DIR, 'console_cmd.txt');
+const RTL_CLIENT_CONFIG_FILE = path.join(os.homedir(), '.rtl_tcp_spectrum_scanner', 'clients.json');
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 const BRIDGE_PORT = 8088;
-// Physically impossible readings are decode artifacts (findings §6.3), never real RF.
-const SANE_MIN_DBM = -125.0;
-const SANE_MAX_DBM = 20.0;
+// The rtl_tcp IQ stream is not calibrated to absolute input power.
+const TRACE_FLOOR_DBFS = -125.0;
+const TRACE_CEILING_DBFS = 10.0;
 
 // Dynamic spectrum datasets per antenna (A..F) with authentic hardware frequency bins
 const ANT_COLORS = {
@@ -139,16 +156,57 @@ const ANT_COLORS = {
   'F': '#ffff00'
 };
 
-let antennaTraces = {
-  'A': [],
-  'B': [],
-  'C': [],
-  'D': [],
-  'E': [],
-  'F': []
+const RTL_CLIENT_LIMIT = 6;
+const RTL_SLOT_RANGES = {
+  A: [470.0, 524.0],
+  B: [524.0, 620.0],
+  C: [470.0, 542.0],
+  D: [518.0, 584.0],
+  E: [554.0, 616.0],
+  F: [470.0, 1000.0]
 };
+const RTL_SLOTS = Object.keys(ANT_COLORS);
 
-let engineProcess = null;
+let sourceTraces = { 'rtl-client-1': [] };
+
+function gridForRange(startMhz, stopMhz, stepHz) {
+  const startHz = Math.round(startMhz * 1e6);
+  const stopHz = Math.round(stopMhz * 1e6);
+  return {
+    startHz,
+    stopHz,
+    stepHz,
+    pointCount: Math.max(1, Math.floor((stopHz - startHz) / stepHz) + 1)
+  };
+}
+
+function clientRange(client, index = appState.rtlClients.indexOf(client)) {
+  const fallback = RTL_SLOT_RANGES[RTL_SLOTS[Math.max(0, index)] || 'A'];
+  const startMhz = Number(client && client.startMhz);
+  const stopMhz = Number(client && client.stopMhz);
+  if (Number.isFinite(startMhz) && Number.isFinite(stopMhz) && startMhz >= 24 && stopMhz <= 1766 && stopMhz > startMhz) {
+    return [startMhz, stopMhz];
+  }
+  return fallback;
+}
+
+function rtlClientsForStatus() {
+  return appState.rtlClients.map((client, index) => {
+    const slot = RTL_SLOTS[index] || 'F';
+    const [startMhz, stopMhz] = clientRange(client, index);
+    return Object.assign({}, client, {
+      slot,
+      color: ANT_COLORS[slot],
+      progress: rtlClientRuntimes.get(client.id)?.progress || null,
+      startMhz,
+      stopMhz,
+      grid: gridForRange(startMhz, stopMhz, appState.rbwHz)
+    });
+  });
+}
+
+const rtlClientRuntimes = new Map();
+let nextBridgePort = BRIDGE_PORT;
 
 let udpDiscoverySocket = null;
 
@@ -242,269 +300,246 @@ function runDiscovery(targetIface = null) {
   });
 }
 
-let bridgePollInterval = null;
+function enabledRtlClients() {
+  return appState.rtlClients.filter(client => client.enabled);
+}
 
-// Engine stdout lines worth echoing to this console. Everything else (per-PDU DMP chatter) is still
-// in SCRATCH_DIR/console_out.log — echoing it all here produced ~30 MB/hour of output.
-const ENGINE_LOG_NOISE_RE = /FIREHOSE EVENT|SWEEP-ID EVENT|BIG PACKET|DEEP-TREE SUB ACCEPTED/;
-const ENGINE_LOG_RE = /★|⚠|✪|JOIN|REFUSE|IDENTITY|OWNERSHIP CLAIMED|NOT OWNER|ABORT|RELEASE|clean disconnect|QUIT|SLP advert|re-arm|Traceback|Error|error|DISCOVERY|\[RF ENGINE\]|\[ENGINE STATUS\]|RUNNING ON PORT/;
-
-// Handshake milestones → operator-facing progress. JOIN → ownership → first sweep takes ~20-30 s
-// on real hardware (findings §6.1), so each stage is surfaced rather than looking like a hang.
-function applyEngineMilestone(line, targetIp) {
-  if (/SLP advert sent/.test(line)) {
-    appState.status = `ANNOUNCING TO AD600 @ ${targetIp}...`;
-  } else if (/JOIN sent/.test(line)) {
-    appState.status = `JOINING SESSION WITH AD600 @ ${targetIp}...`;
-  } else if (/JOIN_REFUSE|IDENTITY IN USE/.test(line)) {
-    appState.status = 'AD600 REFUSED THE SESSION - RETRYING...';
-  } else if (/^CONNECTED$/.test(line.trim()) || /\*\*\* JOINED/.test(line)) {
-    if (appState.connectionState !== 'CONNECTED') {
-      appState.connectionState = 'CONNECTED';
-      console.log('[CONNECTION] AD600 session established');
+function loadRtlClientProfiles() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(RTL_CLIENT_CONFIG_FILE, 'utf8'));
+    if (!Array.isArray(saved)) return;
+    const savedDefault = saved.find(entry => entry && entry.id === 'rtl-client-1');
+    if (savedDefault) {
+      const [startMhz, stopMhz] = clientRange(savedDefault, 0);
+      appState.rtlClients[0].startMhz = startMhz;
+      appState.rtlClients[0].stopMhz = stopMhz;
     }
-    appState.status = appState.scanState === 'SCANNING'
-      ? 'CONNECTED - CLAIMING SCAN SLOT (FIRST SWEEP IN ~30 s)...'
-      : `CONNECTED TO AD600 @ ${targetIp} - READY`;
-  } else if (/clean-grant fan-out complete/.test(line)) {
-    if (appState.scanState === 'SCANNING') appState.status = 'CONNECTED - PRIMING SCAN ENGINE...';
-  } else if (/OWNERSHIP CLAIMED/.test(line)) {
-    appState.scanSlotOwned = true;
-    if (appState.scanState === 'SCANNING') appState.status = 'SCAN SLOT CLAIMED - WAITING FOR FIRST SWEEP...';
-  } else if (/NOT OWNER \(|ABORTING arm|NOT-OWNER \(GET_FAIL/.test(line)) {
-    appState.scanSlotOwned = false;
-    appState.status = 'SCAN SLOT HELD BY ANOTHER CONTROLLER (WWB / SOUNDBASE?) - CLOSE IT OR POWER-CYCLE THE AD600';
-  } else if (/^\[ENGINE STATUS\]/.test(line) && /slot-0|power-cycle|couldn't start|launch failed|reconnecting/.test(line)) {
-    appState.status = line.replace(/^\[ENGINE STATUS\]\s*/, '').toUpperCase();
-  } else if (/^\[DISCOVERY FAILED\]/.test(line)) {
-    appState.status = line.replace(/^\[DISCOVERY FAILED\]\s*/, '').toUpperCase();
+    const profiles = [];
+    for (const entry of saved) {
+      if (!entry || typeof entry !== 'object') continue;
+      const name = String(entry.name || '').trim().slice(0, 64);
+      const host = String(entry.host || '').trim();
+      const port = Number.parseInt(entry.port, 10);
+      if (!entry.id || entry.id === 'rtl-client-1' || !name || !host || /\s/.test(host) ||
+          host.length > 253 || !Number.isInteger(port) || port < 1 || port > 65535) continue;
+      const defaultClient = appState.rtlClients[0];
+      if ((defaultClient.host.toLowerCase() === host.toLowerCase() && defaultClient.port === port) ||
+          profiles.some(client => client.id === String(entry.id) ||
+            (client.host.toLowerCase() === host.toLowerCase() && client.port === port))) continue;
+      const [startMhz, stopMhz] = clientRange(entry, profiles.length + 1);
+      profiles.push({ id: String(entry.id), name, host, port, startMhz, stopMhz, enabled: false, state: 'DISCONNECTED' });
+      if (profiles.length >= RTL_CLIENT_LIMIT - 1) break;
+    }
+    appState.rtlClients = [appState.rtlClients[0], ...profiles];
+    sourceTraces = Object.fromEntries(appState.rtlClients.map(client => [client.id, []]));
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('[RTL CLIENTS] Could not load saved client profiles:', err.message);
   }
 }
 
-function start18EngineScan() {
-  if (engineProcess) return;
-
-  // Best-effort cleanup of orphaned engine processes left behind by a prior Node process
-  // lifetime (e.g. this server crashed without going through stop18EngineScan). Scoped to this
-  // installation's own absolute script paths rather than bare filenames, so it can't match an
-  // unrelated process that happens to share a script name.
+function saveRtlClientProfiles() {
+  const profiles = appState.rtlClients.map(client => client.id === 'rtl-client-1'
+    ? { id: client.id, startMhz: client.startMhz, stopMhz: client.stopMhz }
+    : ({ id: client.id, name: client.name, host: client.host, port: client.port, startMhz: client.startMhz, stopMhz: client.stopMhz }));
   try {
-    const consolePyPath = path.join(ENGINE_DIR, 'ad600_console.py');
-    const bootstrapPyPath = path.join(os.tmpdir(), 'ad600_bridge_launch.py');
-    execSync(`pkill -15 -f "${consolePyPath}" 2>/dev/null || true`);
-    execSync(`pkill -15 -f "${bootstrapPyPath}" 2>/dev/null || true`);
-  } catch (e) {}
-
-  getNetworkInterfaces();
-  const targetIp = appState.activeTargetIp;
-  if (!targetIp) {
-    appState.connectionState = 'DISCONNECTED';
-    appState.status = 'NO AD600 DISCOVERED YET - CHECK CABLING / INTERFACE';
-    return;
+    fs.mkdirSync(path.dirname(RTL_CLIENT_CONFIG_FILE), { recursive: true });
+    fs.writeFileSync(RTL_CLIENT_CONFIG_FILE, JSON.stringify(profiles, null, 2) + '\n', { mode: 0o600 });
+    return true;
+  } catch (err) {
+    console.error('[RTL CLIENTS] Could not save client profiles:', err.message);
+    return false;
   }
-  const targetDev = appState.discoveredDevices[targetIp];
+}
 
-  // An explicitly chosen NIC wins; otherwise pick the one whose real subnet contains the device.
-  let ifaceObj = null;
-  if (appState.selectedInterface && appState.selectedInterface !== 'ALL') {
-    ifaceObj = appState.interfaces.find(i => i.name === appState.selectedInterface) || null;
+function syncRtlConnectionState() {
+  const enabled = enabledRtlClients();
+  const rangeClients = enabled.length ? enabled : appState.rtlClients.slice(0, 1);
+  if (rangeClients.length) {
+    const ranges = rangeClients.map(client => clientRange(client));
+    appState.startFreqMhz = Math.min(...ranges.map(range => range[0]));
+    appState.endFreqMhz = Math.max(...ranges.map(range => range[1]));
+    appState.grid = gridForRange(appState.startFreqMhz, appState.endFreqMhz, appState.rbwHz);
   }
-  if (!ifaceObj) ifaceObj = ifaceForHost(targetIp);
-  if (!ifaceObj && targetDev && targetDev.iface) {
-    ifaceObj = appState.interfaces.find(i => i.name === targetDev.iface) || null;
-  }
-  if (!ifaceObj) {
-    appState.connectionState = 'DISCONNECTED';
-    appState.status = `NO NETWORK INTERFACE ON THE SAME SUBNET AS ${targetIp}`;
-    return;
-  }
+  const connected = enabled.filter(client => client.state === 'CONNECTED').length;
+  appState.connectionState = enabled.length === 0
+    ? 'DISCONNECTED'
+    : (connected === enabled.length ? 'CONNECTED' : 'CONNECTING');
+  appState.activeTargetIp = enabled.length ? enabled[0].host : null;
+  appState.inputLabel = enabled.map(client => client.name).join(', ') || 'RTL-SDR';
 
-  console.log(`[RF ENGINE] Spawning Python bridge for ${targetIp} on ${ifaceObj.name} (${ifaceObj.address}/${ifaceObj.netmask})...`);
+  if (appState.scanState === 'SCANNING') {
+    appState.status = `SCANNING ${enabled.length} RTL_TCP RECEIVER${enabled.length === 1 ? '' : 'S'}`;
+  } else if (enabled.length === 0) {
+    appState.status = 'NO RTL_TCP CLIENTS ENABLED';
+  } else if (connected === enabled.length) {
+    appState.status = `${connected} RTL_TCP RECEIVER${connected === 1 ? '' : 'S'} CONNECTED - READY`;
+  } else {
+    appState.status = `CONNECTING TO ${enabled.length} RTL_TCP RECEIVER${enabled.length === 1 ? '' : 'S'} (${connected} CONNECTED)...`;
+  }
+}
 
+function allocateBridgePort() {
+  const allocated = new Set(Array.from(rtlClientRuntimes.values(), runtime => runtime.bridgePort));
+  while (allocated.has(nextBridgePort)) nextBridgePort++;
+  const port = nextBridgePort++;
+  if (nextBridgePort > 65000) nextBridgePort = BRIDGE_PORT;
+  return port;
+}
+
+function startRtlTcpClient(client) {
+  if (!client || !client.enabled || rtlClientRuntimes.has(client.id)) return;
+  const [startMhz, stopMhz] = clientRange(client);
+  const clientGrid = gridForRange(startMhz, stopMhz, appState.rbwHz);
+  const bridgePort = allocateBridgePort();
+  const backendPath = path.join(ENGINE_DIR, 'rtl_tcp_backend.py');
   const env = Object.assign({}, process.env, {
-    PYTHONPATH: ENGINE_DIR,
-    AD600_ENGINE_DIR: ENGINE_DIR,
-    AD600_CLIENT_DIR: ENGINE_DIR,
-    AD600_CONSOLE_PY: path.join(ENGINE_DIR, 'ad600_console.py'),
-    AD600_REACTIVE_FEED: 'BUILTIN',
-    AD600_ENGINE_SCRATCH: SCRATCH_DIR,
-    AD600_RT_COMPRESSION: String(appState.rbwComp || '14'),
-    AD600_CURVE_SELECT: String(computeCurveMask(appState.selectedAntennas)),
-    AD600_REPEAT: appState.scanMode === 'SINGLE' ? '1' : '255',
-    AD600_REACTIVE_ACK: '1',
-    AD600_DROP_SPURIOUS: '1',
-    AD600_ARM_ON_STATUS: '1',
-    AD600_OWNER_CLAIM: '1',
-    AD600_PRIME_SETTLE: '4.5',
-    AD600_OWNER_CLAIM_TIMEOUT: '12.0',
-    AD600_SCANREADY_TIMEOUT: '12.0',
-    AD600_EMIT_FRAMES: '1',
-    PYTHONUNBUFFERED: '1'
+    PYTHONUNBUFFERED: '1',
+    RTL_TCP_HOST: client.host,
+    RTL_TCP_PORT: String(client.port),
+    RTL_BRIDGE_PORT: String(bridgePort),
+    RTL_SAMPLE_RATE: String(process.env.RTL_SAMPLE_RATE || 1800000),
+    RTL_TUNER_GAIN_DB: String(process.env.RTL_TUNER_GAIN_DB || 25),
+    RTL_TUNER_AGC: process.env.RTL_TUNER_AGC === '1' ? '1' : '0',
+    RTL_DIGITAL_AGC: process.env.RTL_DIGITAL_AGC === '1' ? '1' : '0',
+    RTL_START_HZ: String(clientGrid.startHz),
+    RTL_STOP_HZ: String(clientGrid.stopHz),
+    RTL_RBW_HZ: String(appState.rbwHz || 350000),
+    RTL_REPEAT: appState.scanMode === 'SINGLE' ? '1' : '255',
+    RTL_START_SWEEP: appState.scanState === 'SCANNING' ? '1' : '0'
   });
-
-  // Ensure scratch directory exists and command file is clean for new connection
-  try {
-    fs.mkdirSync(SCRATCH_DIR, { recursive: true });
-    fs.writeFileSync(CMD_FILE, '');
-  } catch (e) {}
-
-  // Runtime values (interface, device record) are passed to the bootstrap script via a JSON file
-  // rather than interpolated into Python source, so nothing here can inject Python.
-  const bridgeConfigPath = path.join(os.tmpdir(), 'ad600_bridge_config.json');
-  const bridgeConfig = {
-    iface: { name: ifaceObj.name, ipv4: ifaceObj.address, netmask: ifaceObj.netmask, mac: ifaceObj.mac },
-    device: {
-      device_ip: targetIp,
-      device_cid: (targetDev && targetDev.cid) || null,
-      device_port: (targetDev && targetDev.sdtPort) || 57383
-    },
-    bridgePort: BRIDGE_PORT,
-    startHz: Math.round((appState.startFreqMhz || 470.0) * 1e6),
-    stopHz: Math.round((appState.endFreqMhz || 608.0) * 1e6),
-    rbwHz: appState.rbwHz || 350000,
-    curveMask: computeCurveMask(appState.selectedAntennas),
-    repeat: appState.scanMode === 'SINGLE' ? 1 : 255,
-    startSweep: appState.scanState === 'SCANNING'
+  const runtime = {
+    clientId: client.id,
+    bridgePort,
+    grid: clientGrid,
+    proc: null,
+    pollInterval: null,
+    pollInFlight: false,
+    commandEpoch: 0,
+    pendingSweepStart: false,
+    progress: null,
+    lastProcessedSweepId: -1,
+    lastSweepComplete: false
   };
-  try {
-    fs.writeFileSync(bridgeConfigPath, JSON.stringify(bridgeConfig));
-  } catch (e) {
-    console.log('[RF ENGINE] Failed to write bridge config JSON:', e.message);
-  }
-
-  // Written to a temp file so __file__ is set correctly. The only JS values interpolated below are
-  // Node-controlled filesystem paths (JSON.stringify-escaped), never user- or network-supplied data.
-  const tmpScript = path.join(os.tmpdir(), 'ad600_bridge_launch.py');
-  const pyCode = `
-import os, sys, time, signal, atexit, json
-sys.path.insert(0, ${JSON.stringify(ENGINE_DIR)})
-import ad600_bridge, ad600_engine, ad600_discovery
-
-with open(${JSON.stringify(bridgeConfigPath)}, 'r', encoding='utf-8') as _cf:
-    _cfg = json.load(_cf)
-
-iface = _cfg['iface']
-dev = _cfg['device']
-
-# The console needs the device's CID for JOIN. If the beacon didn't carry it, ask the device via
-# SLP on the chosen interface rather than guessing some other unit's identity.
-if not dev.get('device_cid'):
-    rec = None
-    try:
-        rec = ad600_discovery.discover(iface['name'], timeout=6)
-    except Exception as e:
-        sys.stderr.write('discovery error: %r\\n' % (e,))
-    if rec and rec.get('device_ip') == dev['device_ip'] and rec.get('device_cid'):
-        dev['device_cid'] = rec['device_cid']
-        dev['device_port'] = rec.get('device_port') or dev['device_port']
-    else:
-        print('[DISCOVERY FAILED] AD600 @ %s did not answer SLP on %s - check cabling' % (dev['device_ip'], iface['name']))
-        sys.stdout.flush()
-        sys.exit(2)
-
-print('[RF ENGINE] Target device CID: %s (controller CID is regenerated per session)' % dev['device_cid'])
-
-br = ad600_bridge.Bridge(port=_cfg['bridgePort'])
-br.serve(block=False)
-
-eng = ad600_engine.Engine(bridge=br)
-br.on_config_change = eng.apply_config
-
-try:
-    br.apply_configuration({
-        'startHz': _cfg['startHz'],
-        'stopHz': _cfg['stopHz'],
-        'rbwHz': _cfg['rbwHz'],
-        'curveMask': _cfg['curveMask'],
-        'repeat': _cfg['repeat']
-    })
-except Exception as e:
-    sys.stderr.write('CONFIG ERR: ' + str(e) + '\\n')
-
-def _cleanup(*args):
-    # eng.stop() runs the graceful QUIT-FIRST teardown (releases the scan slot) before any hard kill.
-    try:
-        eng.stop()
-    except Exception:
-        pass
-    try:
-        if hasattr(eng, 'proc') and eng.proc and eng.proc.poll() is None:
-            eng.proc.kill()
-    except Exception:
-        pass
-
-atexit.register(_cleanup)
-signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
-
-eng.start(dev, iface)
-
-if _cfg.get('startSweep'):
-    br.sweep_start()
-
-sys.stdout.write('PYTHON RF BRIDGE ENGINE RUNNING ON PORT %d\\n' % _cfg['bridgePort'])
-sys.stdout.flush()
-
-# Report only the supervisor's human-readable note, and only when it changes.
-_last = None
-while True:
-    time.sleep(1)
-    note = (eng.status() or {}).get('note') or ''
-    if note and note != _last:
-        sys.stdout.write('[ENGINE STATUS] ' + note + '\\n')
-        sys.stdout.flush()
-    _last = note
-`;
-
-  fs.writeFileSync(tmpScript, pyCode);
-  const proc = spawn(PYTHON_BIN, [tmpScript], { env });
-  engineProcess = proc;
-  appState.scanSlotOwned = false;
-
+  const proc = spawn(PYTHON_BIN, [backendPath], { env });
+  runtime.proc = proc;
+  rtlClientRuntimes.set(client.id, runtime);
+  client.state = 'CONNECTING';
+  console.log(`[RTL TCP] Starting client ${client.name} at ${client.host}:${client.port}`);
   let stdoutBuffer = '';
-  proc.stdout.on('data', d => {
-    if (engineProcess !== proc) return; // a newer engine process has already taken over
-    stdoutBuffer += d.toString('utf8');
-    const completeLines = stdoutBuffer.split('\n');
-    stdoutBuffer = completeLines.pop(); // keep the trailing partial line for the next chunk
-
-    for (const l of completeLines) {
-      if (ENGINE_LOG_RE.test(l) && !ENGINE_LOG_NOISE_RE.test(l)) console.log('[ENGINE]', l.trim());
-      applyEngineMilestone(l, targetIp);
-      const match = l.match(/^BIAS\s+([A-F])\s+([01])/i);
-      if (match) {
-        const ant = match[1].toUpperCase();
-        const isOn = match[2] === '1';
-        if (appState.antennaBias[ant] !== isOn) {
-          console.log(`[BIAS] Antenna ${ant} bias reported ${isOn ? 'ON' : 'OFF'} by device`);
-        }
-        appState.antennaBias[ant] = isOn;
-        const pend = appState.antennaBiasPending[ant];
-        if (pend && pend.enabled === isOn) delete appState.antennaBiasPending[ant];
+  proc.stdout.on('data', data => {
+    if (rtlClientRuntimes.get(client.id) !== runtime) return;
+    stdoutBuffer += data.toString('utf8');
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop();
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      console.log(`[RTL ${client.name}]`, line);
+      if (line.startsWith('[RTL TCP] CONNECTED')) {
+        client.state = 'CONNECTED';
+        syncRtlConnectionState();
+      } else if (line.startsWith('[RTL TCP] DISCONNECTED') || line.startsWith('[RTL TCP] CONNECTING')) {
+        client.state = 'RECONNECTING';
+        syncRtlConnectionState();
       }
     }
   });
-
-  proc.stderr.on('data', d => {
-    if (engineProcess !== proc) return;
-    console.log('[ENGINE STDERR]', d.toString('utf8').trim());
+  proc.stderr.on('data', data => {
+    if (rtlClientRuntimes.get(client.id) === runtime) console.error(`[RTL ${client.name} ERROR]`, data.toString('utf8').trim());
   });
+  proc.on('error', err => {
+    if (rtlClientRuntimes.get(client.id) !== runtime) return;
+    client.state = 'ERROR';
+    client.error = err.message;
+    syncRtlConnectionState();
+  });
+  proc.on('exit', code => {
+    console.log(`[RTL ${client.name}] Backend exited with code ${code}`);
+    if (rtlClientRuntimes.get(client.id) !== runtime) return;
+    rtlClientRuntimes.delete(client.id);
+    clearInterval(runtime.pollInterval);
+    client.state = 'DISCONNECTED';
+    if (appState.scanState === 'SCANNING' && enabledRtlClients().length === 0) appState.scanState = 'STOPPED';
+    syncRtlConnectionState();
+  });
+  startBridgePolling(runtime);
+  syncRtlConnectionState();
+}
 
-  proc.on('exit', (code) => {
-    console.log(`[ENGINE] Process exited with code ${code}`);
-    if (engineProcess !== proc) return; // a newer engine process already replaced this one
-    engineProcess = null;
-    appState.connectionState = 'DISCONNECTED';
-    appState.scanSlotOwned = false;
-    appState.antennaBiasPending = {};
-    if (appState.scanState === 'SCANNING') appState.scanState = 'STOPPED';
-    if (!/DISCOVERY|NO NETWORK|SLOT HELD/.test(appState.status)) {
-      appState.status = 'DISCONNECTED FROM AD600';
+function stopRtlTcpClient(clientId) {
+  const runtime = rtlClientRuntimes.get(clientId);
+  rtlClientRuntimes.delete(clientId);
+  if (runtime) {
+    clearInterval(runtime.pollInterval);
+    try { runtime.proc.kill('SIGTERM'); } catch (e) {}
+  }
+  sourceTraces[clientId] = [];
+  const client = appState.rtlClients.find(item => item.id === clientId);
+  if (client) client.state = 'DISCONNECTED';
+  syncRtlConnectionState();
+}
+
+function requestBridge(runtime, path, payload, callback, retryCount = 0, epoch = runtime.commandEpoch) {
+  if (rtlClientRuntimes.get(runtime.clientId) !== runtime || runtime.commandEpoch !== epoch) return;
+  const postData = payload === undefined ? null : JSON.stringify(payload);
+  const options = {
+    hostname: '127.0.0.1',
+    port: runtime.bridgePort,
+    path,
+    method: postData === null ? 'GET' : 'POST',
+    headers: postData === null ? {} : {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData)
     }
-    if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
+  };
+  const req = http.request(options, res => {
+    let body = '';
+    res.on('data', chunk => body += chunk);
+    res.on('end', () => {
+      if (callback && rtlClientRuntimes.get(runtime.clientId) === runtime && runtime.commandEpoch === epoch) callback(res, body);
+    });
   });
+  req.on('error', () => {
+    if (retryCount < 10 && rtlClientRuntimes.get(runtime.clientId) === runtime) {
+      setTimeout(() => requestBridge(runtime, path, payload, callback, retryCount + 1, epoch), 100);
+    } else if (callback && runtime.commandEpoch === epoch) {
+      callback(null, 'Bridge did not respond');
+    }
+  });
+  req.setTimeout(5000, () => req.destroy());
+  if (postData !== null) req.write(postData);
+  req.end();
+}
 
-  startBridgePolling();
+function broadcastBridgeRequest(path, payload, callback) {
+  for (const runtime of rtlClientRuntimes.values()) requestBridge(runtime, path, payload, callback);
+}
+
+// Configure and restart in order. Ignore polls from before this command, including a previous
+// single sweep's completion, until the bridge has acknowledged the new run.
+function restartRtlSweep(runtime, configuration = {}) {
+  runtime.commandEpoch++;
+  runtime.pendingSweepStart = true;
+  runtime.lastSweepComplete = false;
+  runtime.progress = null;
+  sourceTraces[runtime.clientId] = [];
+  const failed = () => {
+    runtime.pendingSweepStart = false;
+    const client = appState.rtlClients.find(item => item.id === runtime.clientId);
+    if (client) { client.state = 'ERROR'; client.error = 'Could not start sweep'; }
+    syncRtlConnectionState();
+  };
+  requestBridge(runtime, '/configuration', Object.assign({}, configuration, {
+    repeat: appState.scanMode === 'SINGLE' ? 1 : 255
+  }), response => {
+    if (!response || response.statusCode !== 200) return failed();
+    if (appState.scanState !== 'SCANNING') { runtime.pendingSweepStart = false; return; }
+    requestBridge(runtime, '/sweep/start', undefined, started => {
+      if (!started || started.statusCode !== 200) return failed();
+      runtime.lastProcessedSweepId = -1;
+      runtime.pendingSweepStart = false;
+    });
+  });
 }
 
 // One-shot bias read (e.g. an explicit re-Connect while already connected). No periodic polling:
@@ -532,110 +567,93 @@ setInterval(() => {
   }
 }, 1000);
 
-let lastProcessedSweepId = -1;
-let bridgePollInFlight = false;
-function startBridgePolling() {
-  if (bridgePollInterval) return;
-  bridgePollInterval = setInterval(() => {
-    if (!engineProcess) {
-      clearInterval(bridgePollInterval);
-      bridgePollInterval = null;
-      return;
-    }
-    // /trace long-polls when no trace exists yet — never stack requests behind it.
-    if (bridgePollInFlight) return;
-    bridgePollInFlight = true;
-
-    const req = http.get(`http://127.0.0.1:${BRIDGE_PORT}/trace`, res => {
+function startBridgePolling(runtime) {
+  runtime.pollInterval = setInterval(() => {
+    if (rtlClientRuntimes.get(runtime.clientId) !== runtime || runtime.pollInFlight) return;
+    runtime.pollInFlight = true;
+    const pollEpoch = runtime.commandEpoch;
+    const req = http.get(`http://127.0.0.1:${runtime.bridgePort}/trace`, res => {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
-        bridgePollInFlight = false;
-        if (res.statusCode !== 200) return; // 409 = no sweep yet; the stdout milestones drive status
+        runtime.pollInFlight = false;
+        if (res.statusCode !== 200 || rtlClientRuntimes.get(runtime.clientId) !== runtime ||
+            pollEpoch !== runtime.commandEpoch || runtime.pendingSweepStart) return;
         try {
           const json = JSON.parse(body);
-          if (json.startHz && json.stopHz && json.stepHz) {
-            appState.grid = {
+          runtime.progress = json.sweeping ? json.progress : null;
+          const expectedGrid = runtime.grid;
+          const gridMatchesConfig = json.startHz === expectedGrid.startHz &&
+            json.stopHz === expectedGrid.stopHz && json.stepHz === expectedGrid.stepHz;
+          if (json.startHz && json.stopHz && json.stepHz && gridMatchesConfig) {
+            runtime.grid = {
               startHz: json.startHz,
               stopHz: json.stopHz,
               stepHz: json.stepHz,
-              pointCount: json.pointCount || (json.series && json.series[0] ? json.series[0].amplitudesDbm.length : 0)
+              pointCount: json.pointCount || (json.series && json.series[0] ? json.series[0].amplitudesDbfs.length : 0)
             };
-            appState.startFreqMhz = json.startHz / 1e6;
-            appState.endFreqMhz = json.stopHz / 1e6;
           }
-          if (json.series && Array.isArray(json.series) && appState.scanState === 'SCANNING' && appState.connectionState === 'CONNECTED') {
-            const isNewData = json.sweepId !== undefined && json.sweepId !== lastProcessedSweepId;
-            if (!isNewData) return;
-            lastProcessedSweepId = json.sweepId;
-            const prevCount = appState.scansCaptured;
-            appState.scansCaptured = json.sweepCount || 0;
-            appState.lastScanTime = Date.now();
-
-            json.series.forEach(s => {
-              const antName = s.name; // 'A'..'F'
-              const rawAmps = s.amplitudesDbm || [];
-              if (rawAmps.length === 0) return;
-              if (!antennaTraces[antName] || antennaTraces[antName].length !== rawAmps.length) {
-                antennaTraces[antName] = rawAmps.map(v => (v > SANE_MIN_DBM && v <= SANE_MAX_DBM ? v : SANE_MIN_DBM - 5));
-              } else {
-                for (let i = 0; i < rawAmps.length; i++) {
-                  // Overwrite only with sane readings, retaining the previous value for empty bins
-                  // and for decode artifacts above the physical ceiling.
-                  const v = rawAmps[i];
-                  if ((v > SANE_MIN_DBM && v <= SANE_MAX_DBM) || antennaTraces[antName][i] === undefined) {
-                    antennaTraces[antName][i] = v;
-                  }
-                }
-              }
+          if (!Array.isArray(json.series) || !json.series[0]?.amplitudesDbfs?.length ||
+              appState.scanState !== 'SCANNING' || !gridMatchesConfig) return;
+          if (json.sweepId === undefined || json.sweepId === runtime.lastProcessedSweepId) return;
+          runtime.lastProcessedSweepId = json.sweepId;
+          runtime.lastSweepComplete = json.sweeping === false;
+          const series = json.series[0];
+          const rawAmps = (series && series.amplitudesDbfs) || [];
+          const previous = sourceTraces[runtime.clientId] || [];
+          if (rawAmps.length) {
+            sourceTraces[runtime.clientId] = rawAmps.map((value, index) => {
+              if (value > TRACE_FLOOR_DBFS && value <= TRACE_CEILING_DBFS) return value;
+              return previous[index] !== undefined ? previous[index] : TRACE_FLOOR_DBFS - 5;
             });
+          }
+          appState.scansCaptured = Math.max(appState.scansCaptured, json.sweepCount || 0);
+          appState.lastScanTime = Date.now();
+          syncRtlConnectionState();
 
-            const curRbwKhz = Math.round((appState.grid?.stepHz || 350000) / 1000);
-            const curPts = appState.grid?.pointCount || 0;
-            // A wide span at a fine RBW arrives as tiles at very uneven rates (findings §6.2) —
-            // say so until every part of the band has been seen at least once.
-            appState.status = json.coverageComplete === false
-              ? `SCANNING - FILLING BAND ${json.coveragePct || 0}% (${curRbwKhz} kHz RBW, ${curPts} Pts)`
-              : `SCANNING AD600 HARDWARE - ${curRbwKhz} kHz RBW (${curPts} Pts)`;
-            if (appState.scansCaptured !== prevCount && appState.scansCaptured % 10 === 1) {
-              const summary = json.series.map(s => {
-                const arr = s.amplitudesDbm || [];
-                return `${s.name}: max ${arr.length ? Math.max(...arr).toFixed(1) : 'N/A'} dBm`;
-              }).join(' | ');
-              console.log(`[SWEEP #${appState.scansCaptured}] ${summary}`);
+          if (appState.scanMode === 'SINGLE' && enabledRtlClients().length > 0 &&
+              enabledRtlClients().every(client => {
+                const activeRuntime = rtlClientRuntimes.get(client.id);
+                return activeRuntime && activeRuntime.lastSweepComplete;
+              })) {
+            appState.scanState = 'STOPPED';
+            for (const runtime of rtlClientRuntimes.values()) {
+              runtime.commandEpoch++;
+              runtime.pendingSweepStart = false;
+              runtime.progress = null;
             }
-
-            if (appState.scanMode === 'SINGLE' && json.sweeping === false) {
-              console.log('[SINGLE SWEEP] Captured sweep snapshot. Auto-stopping scan.');
-              appState.scanState = 'STOPPED';
-              appState.status = 'SINGLE SWEEP COMPLETED (CONNECTED - READY)';
-              http.get(`http://127.0.0.1:${BRIDGE_PORT}/sweep/stop`, () => {}).on('error', () => {});
-            }
+            broadcastBridgeRequest('/sweep/stop');
+            syncRtlConnectionState();
           }
         } catch (e) {}
       });
     });
     req.setTimeout(5000, () => req.destroy());
-    req.on('error', () => { bridgePollInFlight = false; });
+    req.on('error', () => { runtime.pollInFlight = false; });
   }, 200);
 }
 
-function stop18EngineScan() {
-  lastProcessedSweepId = -1;
-  if (bridgePollInterval) { clearInterval(bridgePollInterval); bridgePollInterval = null; }
+function stopAllRtlTcpClients() {
+  for (const client of appState.rtlClients) {
+    client.enabled = false;
+    stopRtlTcpClient(client.id);
+  }
   appState.antennaBiasPending = {};
-  if (engineProcess) {
-    // SIGTERM is caught inside the Python bootstrap and triggers its atexit cleanup, which runs
-    // eng.stop()'s graceful QUIT-FIRST teardown (releases the scan slot) before the process exits.
-    try { engineProcess.kill('SIGTERM'); } catch (e) {}
-    engineProcess = null;
+}
+
+function clearSourceTraces() {
+  sourceTraces = {};
+  for (const client of enabledRtlClients()) sourceTraces[client.id] = [];
+  appState.scansCaptured = 0;
+  appState.lastScanTime = null;
+  for (const runtime of rtlClientRuntimes.values()) {
+    runtime.lastProcessedSweepId = -1;
+    runtime.lastSweepComplete = false;
   }
 }
 
 function initAcnSpectrumIngest() {
-  runDiscovery();
-  // re-probe periodically so a device plugged in after launch still shows up
-  setInterval(() => { if (appState.connectionState === 'DISCONNECTED') runDiscovery(); }, 30000);
+  getNetworkInterfaces();
 }
 
 // Shared frequency-band <optgroup> markup for the display-zoom selector and every per-antenna /
@@ -644,7 +662,7 @@ function bandOptionsHtml(selectedValue, customLabel) {
   customLabel = customLabel || 'Custom...';
   const sel = v => (v === selectedValue ? ' selected' : '');
   return `
-            <optgroup label="Shure Bands">
+            <optgroup label="Wireless Mic Bands — Shure">
               <option value="G57"${sel('G57')}>G57: 470 – 608 MHz</option>
               <option value="G57_PLUS"${sel('G57_PLUS')}>G57+: 470 – 616 MHz</option>
               <option value="G10"${sel('G10')}>G10: 470 – 542 MHz</option>
@@ -654,20 +672,107 @@ function bandOptionsHtml(selectedValue, customLabel) {
               <option value="K54"${sel('K54')}>K54: 608 – 663 MHz</option>
               <option value="X55"${sel('X55')}>X55: 940 – 960 MHz</option>
             </optgroup>
-            <optgroup label="Sennheiser Bands">
-              <option value="A1_A4"${sel('A1_A4')}>A1-A4: 470 – 558 MHz</option>
-              <option value="A5_A8"${sel('A5_A8')}>A5-A8: 550 – 608 MHz</option>
+            <optgroup label="Wireless Mic Bands — Sennheiser">
+              <option value="A1_A4"${sel('A1_A4')}>EM 6000 A1–A4: 470 – 558 MHz</option>
+              <option value="A5_A8"${sel('A5_A8')}>EM 6000 A5–A8: 550 – 638 MHz</option>
+              <option value="S_6000_B1_B4"${sel('S_6000_B1_B4')}>EM 6000 B1–B4: 630 – 718 MHz</option>
+              <option value="S_6000_B5_B8"${sel('S_6000_B5_B8')}>EM 6000 B5–B8: 710 – 798 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser Evolution G1 — Legacy">
+              <option value="S_G1_A"${sel('S_G1_A')}>G1 A: 518 – 550 MHz</option>
+              <option value="S_G1_B"${sel('S_G1_B')}>G1 B: 630 – 662 MHz</option>
+              <option value="S_G1_C"${sel('S_G1_C')}>G1 C: 740 – 772 MHz</option>
+              <option value="S_G1_D"${sel('S_G1_D')}>G1 D: 790 – 822 MHz</option>
+              <option value="S_G1_E"${sel('S_G1_E')}>G1 E: 838 – 870 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser Evolution G2 — Legacy">
+              <option value="S_G2_A"${sel('S_G2_A')}>G2 A: 518 – 554 MHz</option>
+              <option value="S_G2_B"${sel('S_G2_B')}>G2 B: 626 – 662 MHz</option>
+              <option value="S_G2_C"${sel('S_G2_C')}>G2 C: 740 – 776 MHz</option>
+              <option value="S_G2_D"${sel('S_G2_D')}>G2 D: 786 – 822 MHz</option>
+              <option value="S_G2_E"${sel('S_G2_E')}>G2 E: 830 – 866 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser Evolution G3">
+              <option value="S_G3_A"${sel('S_G3_A')}>G3 A: 516 – 558 MHz</option>
+              <option value="S_G3_A2"${sel('S_G3_A2')}>G3 100 LE A2: 518 – 554 MHz</option>
+              <option value="S_G3_G"${sel('S_G3_G')}>G3 G: 566 – 608 MHz</option>
+              <option value="S_G3_B"${sel('S_G3_B')}>G3 B: 626 – 668 MHz</option>
+              <option value="S_G3_B2"${sel('S_G3_B2')}>G3 100 LE B2: 626 – 662 MHz</option>
+              <option value="S_G3_C"${sel('S_G3_C')}>G3 C: 734 – 776 MHz</option>
+              <option value="S_G3_D"${sel('S_G3_D')}>G3 D: 780 – 822 MHz</option>
+              <option value="S_G3_E"${sel('S_G3_E')}>G3 E: 823 – 865 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser Evolution G4">
+              <option value="S_G4_A1"${sel('S_G4_A1')}>G4 A1: 470 – 516 MHz</option>
+              <option value="S_G4_A"${sel('S_G4_A')}>G4 A: 516 – 558 MHz</option>
+              <option value="S_G4_AS"${sel('S_G4_AS')}>G4 AS: 520 – 558 MHz</option>
+              <option value="S_G4_G"${sel('S_G4_G')}>G4 G: 566 – 608 MHz</option>
+              <option value="S_G4_GB"${sel('S_G4_GB')}>G4 GB: 606 – 648 MHz</option>
+              <option value="S_G4_B"${sel('S_G4_B')}>G4 B: 626 – 668 MHz</option>
+              <option value="S_G4_C"${sel('S_G4_C')}>G4 C: 734 – 776 MHz</option>
+              <option value="S_G4_CTH"${sel('S_G4_CTH')}>G4 C-TH: 748.2 – 757.8 MHz</option>
+              <option value="S_G4_D"${sel('S_G4_D')}>G4 D: 780 – 822 MHz</option>
+              <option value="S_G4_TH"${sel('S_G4_TH')}>G4 TH: 794 – 806 MHz</option>
+              <option value="S_G4_JB"${sel('S_G4_JB')}>G4 JB: 806 – 810 MHz</option>
+              <option value="S_G4_E"${sel('S_G4_E')}>G4 E: 823 – 865 MHz</option>
+              <option value="S_G4_KP"${sel('S_G4_KP')}>G4 K+: 925 – 937.5 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser Evolution G4 300/500">
+              <option value="S_G4_AWPLUS"${sel('S_G4_AWPLUS')}>G4 AW+: 470 – 558 MHz</option>
+              <option value="S_G4_AW30"${sel('S_G4_AW30')}>G4 AW30: 470 – 558 MHz</option>
+              <option value="S_G4_GW1"${sel('S_G4_GW1')}>G4 GW1: 558 – 608 MHz</option>
+              <option value="S_G4_GW"${sel('S_G4_GW')}>G4 GW: 558 – 626 MHz</option>
+              <option value="S_G4_GBW"${sel('S_G4_GBW')}>G4 GBW: 606 – 678 MHz</option>
+              <option value="S_G4_BW"${sel('S_G4_BW')}>G4 BW: 626 – 698 MHz</option>
+              <option value="S_G4_CW"${sel('S_G4_CW')}>G4 CW: 718 – 790 MHz</option>
+              <option value="S_G4_CWTH"${sel('S_G4_CWTH')}>G4 CW-TH: 748.2 – 757.8 MHz</option>
+              <option value="S_G4_DW"${sel('S_G4_DW')}>G4 DW: 790 – 865 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser 2000 Series">
+              <option value="S_2000_AW"${sel('S_2000_AW')}>2000 AW: 516 – 558 MHz</option>
+              <option value="S_2000_GW"${sel('S_2000_GW')}>2000 GW: 558 – 626 MHz</option>
+              <option value="S_2000_BW"${sel('S_2000_BW')}>2000 BW: 626 – 698 MHz</option>
+              <option value="S_2000_CW"${sel('S_2000_CW')}>2000 CW: 718 – 790 MHz</option>
+              <option value="S_2000_DW"${sel('S_2000_DW')}>2000 DW: 790 – 865 MHz</option>
+              <option value="S_2000_AWPLUS"${sel('S_2000_AWPLUS')}>2000 AW+: 470 – 558 MHz</option>
+              <option value="S_2000_GW1"${sel('S_2000_GW1')}>2000 GW1: 558 – 608 MHz</option>
+              <option value="S_2000_GBW"${sel('S_2000_GBW')}>2000 GBW: 606 – 678 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser 3000/5000 Series — Legacy">
+              <option value="S_3000_A"${sel('S_3000_A')}>3000/5000 A: 470 – 560 MHz</option>
+              <option value="S_3000_B"${sel('S_3000_B')}>3000/5000 B: 518 – 608 MHz</option>
+              <option value="S_3000_C"${sel('S_3000_C')}>3000/5000 C: 548 – 638 MHz</option>
+              <option value="S_3000_D"${sel('S_3000_D')}>3000/5000 D: 614 – 704 MHz</option>
+              <option value="S_3000_E"${sel('S_3000_E')}>3000/5000 E: 678 – 768 MHz</option>
+              <option value="S_3000_F"${sel('S_3000_F')}>3000/5000 F: 708 – 798 MHz</option>
+              <option value="S_3000_G"${sel('S_3000_G')}>3000/5000 G: 776 – 866 MHz</option>
+              <option value="S_3000_H"${sel('S_3000_H')}>3000/5000 H: 814 – 904 MHz</option>
+              <option value="S_3000_II_L"${sel('S_3000_II_L')}>3000/5000-II L: 470 – 638 MHz</option>
+              <option value="S_3000_II_N"${sel('S_3000_II_N')}>3000/5000-II N: 614 – 798 MHz</option>
+              <option value="S_3000_II_P"${sel('S_3000_II_P')}>3000/5000-II P: 776 – 960 MHz</option>
+            </optgroup>
+            <optgroup label="Sennheiser EW-D Digital">
+              <option value="S_EWD_Q1_6"${sel('S_EWD_Q1_6')}>EW-D Q1-6: 470.2 – 526 MHz</option>
+              <option value="S_EWD_R1_6"${sel('S_EWD_R1_6')}>EW-D R1-6: 520 – 576 MHz</option>
+              <option value="S_EWD_R4_9"${sel('S_EWD_R4_9')}>EW-D R4-9: 552 – 607.8 MHz</option>
+              <option value="S_EWD_S1_7"${sel('S_EWD_S1_7')}>EW-D S1-7: 606.2 – 662 MHz</option>
+              <option value="S_EWD_S4_7"${sel('S_EWD_S4_7')}>EW-D S4-7: 630 – 662 MHz</option>
+              <option value="S_EWD_S7_10"${sel('S_EWD_S7_10')}>EW-D S7-10: 662 – 693.8 MHz</option>
+              <option value="S_EWD_U1_5"${sel('S_EWD_U1_5')}>EW-D U1/5: 823.2–831.8 / 863.2–864.8 MHz</option>
+              <option value="S_EWD_V3_4"${sel('S_EWD_V3_4')}>EW-D V3-4: 925.2 – 937.3 MHz</option>
             </optgroup>
             <optgroup label="Frequency Spans">
               <option value="VHF"${sel('VHF')}>VHF: 174 – 216 MHz</option>
               <option value="470_524"${sel('470_524')}>Low UHF: 470 – 524 MHz</option>
               <option value="524_620"${sel('524_620')}>Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000"${sel('608_1000')}>Upper: 608 – 1000 MHz</option>
+              <option value="608_1000"${sel('608_1000')}>Upper UHF: 608 – 1000 MHz</option>
               <option value="AFTRCC"${sel('AFTRCC')}>AFTRCC: 1435 – 1525 MHz</option>
               <option value="470_1000"${sel('470_1000')}>470 – 1000 MHz (1 GHz)</option>
-              <option value="470_2000"${sel('470_2000')}>470 – 2000 MHz (2 GHz)</option>
-              <option value="174_1000"${sel('174_1000')}>174 – 1000 MHz (1 GHz)</option>
-              <option value="FULL_SPAN"${sel('FULL_SPAN')}>Full Span: 174 – 2000 MHz (2 GHz)</option>
+              <option value="470_1766"${sel('470_1766')}>470 – 1766 MHz (R820T upper span)</option>
+              <option value="174_1000"${sel('174_1000')}>174 – 1000 MHz</option>
+              <option value="FULL_SPAN"${sel('FULL_SPAN')}>Full Span: 24 – 1766 MHz (R820T)</option>
+            </optgroup>
+            <optgroup label="Custom Range">
               <option value="CUSTOM"${sel('CUSTOM')}>${customLabel}</option>
             </optgroup>`;
 }
@@ -678,7 +783,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Shure AD600 Node.js Spectrum Manager</title>
+  <title>RTL-SDR Web Spectrum Scanner</title>
   <script src="/vendor/chart.umd.min.js"></script>
   <style>
     :root {
@@ -748,6 +853,47 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       align-items: center;
       flex-wrap: wrap;
     }
+
+    .rtl-client-manager {
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: rgba(7, 11, 19, 0.45);
+    }
+
+    .rtl-client-manager-header, .rtl-client-add-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .rtl-client-manager-header { justify-content: space-between; margin-bottom: 7px; }
+    .rtl-client-hint, .rtl-client-endpoint { color: var(--text-muted); font-size: 11px; }
+    .rtl-client-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 6px; }
+    .rtl-client-card { min-width: 0; display: flex; flex-direction: column; gap: 7px; padding: 8px 9px; background: var(--bg-dark); border: 1px solid var(--border); border-left: 3px solid var(--receiver-color, var(--accent)); border-radius: 5px; }
+    .rtl-client-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+    .rtl-client-main { display: flex; min-width: 0; align-items: center; gap: 8px; }
+    .rtl-client-main input { accent-color: var(--accent); }
+    .rtl-client-name { font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rtl-client-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .rtl-client-state { color: var(--text-muted); font-size: 10px; text-transform: uppercase; }
+    .rtl-client-state.connected { color: var(--accent); }
+    .rtl-client-state.error { color: var(--danger); }
+    .rtl-client-remove { padding: 3px 7px; color: var(--text-muted); cursor: pointer; }
+    .rtl-client-remove:disabled { opacity: 0.45; cursor: default; }
+    .rtl-client-slot { flex: 0 0 auto; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid currentColor; border-radius: 4px; font-size: 11px; font-weight: 800; }
+    .rtl-client-range-select { width: 100%; padding: 5px 7px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
+    .rtl-client-custom-range { display: flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 10px; }
+    .rtl-client-custom-range[hidden] { display: none; }
+    .rtl-client-custom-range input { min-width: 0; width: 76px; padding: 4px 5px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
+    .rtl-client-custom-range button { padding: 4px 7px; font-size: 10px; }
+    .antenna-cards-grid { display: none !important; }
+    .rtl-client-add-row { margin-top: 7px; flex-wrap: wrap; }
+    .rtl-client-add-row input { min-width: 100px; padding: 5px 7px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
+    .rtl-client-add-row #rtlClientName { width: 150px; }
+    .rtl-client-add-row #rtlClientHost { flex: 1; }
+    .rtl-client-add-row #rtlClientPort { width: 80px; }
+    #rtlClientMessage { min-height: 13px; margin-top: 4px; color: var(--danger); font-size: 11px; }
 
     .control-group {
       display: flex;
@@ -1355,32 +1501,44 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       color: var(--text-muted);
     }
 
+    .graph-band-labels {
+      color: #cbd5e1;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.4;
+    }
+
     .chart-wrapper {
       position: relative;
       flex: 1;
       min-height: 280px;
     }
+
+    #card_B, #card_C, #card_D, #card_E, #card_F,
+    #card_AB, #card_CD, #card_EF { display: none !important; }
+    #card_A .antenna-card-label input, #card_A .ant-rename-btn,
+    #card_A .max-btn, #card_A .bias-btn, #card_A .antenna-badge { display: none !important; }
   </style>
 </head>
 <body>
 
   <div class="header">
     <div class="brand">
-      <div class="title">AD600 Spectrum Manager</div>
+      <div class="title">RTL-SDR Spectrum Scanner</div>
     </div>
     <div class="header-right" style="display: flex; flex-direction: column; align-items: flex-end; gap: 5px;">
       <div class="status-badge">
         <div id="statusDot" class="status-dot"></div>
-        <span id="statusText">DISCOVERING...</span>
+        <span id="statusText">NO RTL_TCP CLIENTS ENABLED</span>
       </div>
-      <span class="view-only-badge" title="Controls are limited to the host computer (AD600_REMOTE_CONTROL=0)">VIEW ONLY</span>
+      <span class="view-only-badge" title="Controls are limited to the host computer (RTL_REMOTE_CONTROL=0)">VIEW ONLY</span>
     </div>
   </div>
 
   <!-- Interactive Controls Panel -->
   <div class="controls-panel">
     <div class="controls-row">
-      <div class="control-group">
+      <div class="control-group" style="display: none;">
         <label class="control-label">Network Interface (NIC)</label>
         <select id="ifaceSelect" onchange="onIfaceSelect(this.value)">
           <option value="ALL">ALL Interfaces (Auto-Probe)</option>
@@ -1388,23 +1546,13 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       </div>
 
       <div class="control-group">
-        <label class="control-label">Target Hardware Device</label>
-        <div style="display: flex; gap: 8px; align-items: center;">
-          <select id="deviceSelect" onchange="onDeviceSelect(this.value)">
-            <option value="">Searching auto-discovery...</option>
-          </select>
-          <button id="connectBtn" class="btn-connect" onclick="toggleConnect()" title="Connect & Negotiate with Shure AD600">CONNECT</button>
-        </div>
-      </div>
-
-      <div class="control-group">
         <label class="control-label">Spectrum Display Range (Zoom)</label>
         <div style="display: flex; gap: 8px; align-items: center;">
           <select id="displayZoomSelect" onchange="onDisplayZoomSelect(this.value)">
-            <option value="LOCKED" selected>Auto-Fit Active Antennas</option>
+            <option value="LOCKED" selected>Auto-Fit Receiver Range</option>
             ${bandOptionsHtml('', 'Custom Display Span...')}
           </select>
-          <button id="lockZoomBtn" class="btn-lock active" onclick="toggleLockZoom()" title="Lock display zoom to match active antenna ranges">
+          <button id="lockZoomBtn" class="btn-lock active" onclick="toggleLockZoom()" title="Lock display zoom to the receiver scan range">
             Lock Zoom
           </button>
         </div>
@@ -1421,34 +1569,26 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       </div>
 
       <div class="control-group">
-        <label class="control-label">RBW / Resolution</label>
+        <label class="control-label">Spectrum Bin Width</label>
         <select id="rbwSelect" onchange="onRbwSelect(this.value)">
-          <option value="50000">50 kHz (Ultra High Res · comp 2)</option>
-          <option value="100000">100 kHz (High Res · comp 4)</option>
-          <option value="350000" selected>350 kHz (Standard · comp 14)</option>
-          <option value="900000">900 kHz (Fast Scan · comp 36)</option>
+          <option value="50000">50 kHz</option>
+          <option value="100000">100 kHz</option>
+          <option value="350000" selected>350 kHz</option>
+          <option value="900000">900 kHz</option>
         </select>
       </div>
     </div>
 
-    <!-- Discrete Antenna Cards with Inline Hardware Scan Range Dropdowns & Scan Controls -->
+    <!-- Scan controls -->
     <div class="control-group">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
-        <label class="control-label">Antenna Inputs & Per-Antenna Hardware Scan Ranges</label>
+        <label class="control-label">Receiver Scan Ranges</label>
         <span id="hwSweepRangeIndicator" style="font-size: 11px; color: var(--accent); font-weight: 600;">
-          Hardware Sweep: 470.0 – 524.0 MHz
+          Configure each receiver above
         </span>
       </div>
       <div class="diversity-row" style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
-        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-          <span class="diversity-row-label">Diversity Pairs</span>
-          <button id="pairBtn_AB" class="btn-diversity ab" onclick="toggleDiversityPair('AB','A','B')" title="Toggle A+B diversity pair — both antennas locked to same range">A / B Pair</button>
-          <button id="pairBtn_CD" class="btn-diversity cd" onclick="toggleDiversityPair('CD','C','D')" title="Toggle C+D diversity pair — both antennas locked to same range">C / D Pair</button>
-          <button id="pairBtn_EF" class="btn-diversity ef" onclick="toggleDiversityPair('EF','E','F')" title="Toggle E+F diversity pair — both antennas locked to same range">E / F Pair</button>
-          <button class="btn-diversity" onclick="enableAllAntennas()" title="Enable all six antennas">All Antennas</button>
-        </div>
-
-        <!-- Continuous / Single Sweep + Start/Stop Spectrum Scan with Antenna Pairs -->
+        <!-- Continuous / Single Sweep + Start/Stop Spectrum Scan -->
         <div class="scan-control-group" style="display: flex; align-items: center; gap: 8px; margin-left: auto;">
           <div class="scan-mode-toggle">
             <button id="modeBtn_continuous" class="mode-btn active" onclick="setScanMode('CONTINUOUS')" title="Continuous Real-Time Spectrum Sweeping">Continuous</button>
@@ -1457,6 +1597,20 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           <button id="scanBtn" class="btn-scan" onclick="toggleScan()">START SPECTRUM SCAN</button>
         </div>
       </div>
+      <section class="rtl-client-manager" aria-label="Antennas">
+        <div class="rtl-client-manager-header">
+          <label class="control-label">Antennas</label>
+          <span class="rtl-client-hint">Manage up to six rtl_tcp receivers. Each antenna has its own color and frequency range; enabled antennas scan together.</span>
+        </div>
+        <div id="rtlClientList" class="rtl-client-list"></div>
+        <form id="rtlClientForm" class="rtl-client-add-row" onsubmit="addRtlClient(event)">
+          <input id="rtlClientName" type="text" maxlength="64" placeholder="Antenna name" value="RTL-SDR 2" required>
+          <input id="rtlClientHost" type="text" maxlength="253" placeholder="rtl-sdr.local or 192.168.1.20" required>
+          <input id="rtlClientPort" type="number" min="1" max="65535" value="1234" aria-label="rtl_tcp port" required>
+          <button class="btn-scan" type="submit" style="padding: 5px 11px; font-size: 11px;">ADD ANTENNA</button>
+        </form>
+        <div id="rtlClientMessage" role="status" aria-live="polite"></div>
+      </section>
       <div class="antenna-cards-grid">
         <!-- Joined Antenna Pair A + B Card -->
         <div id="card_AB" class="antenna-card antenna-pair-card" style="display: none; border-left: 3px solid #00ffaa; border-right: 3px solid #00b0ff;">
@@ -1473,7 +1627,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_AB" onchange="onPairRangePreset('AB', this.value)">
-            ${bandOptionsHtml('470_524')}
+            ${bandOptionsHtml('CUSTOM')}
           </select>
           <div id="antCustom_AB" class="antenna-custom-inputs">
             <input type="number" id="customStart_AB" step="0.5" value="470.0" onchange="onPairCustomInput('AB')" oninput="onPairCustomInput('AB')">
@@ -1489,7 +1643,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             <div style="display: flex; align-items: center; gap: 4px;">
               <label class="antenna-card-label">
                 <input type="checkbox" name="antennaCb" value="A" checked onchange="onAntennaChange('A')">
-                <span id="antNameSpan_A" style="color: #00ffaa;">Antenna A</span>
+                <span id="antNameSpan_A" style="color: #00ffaa;">Shared Scan Range</span>
               </label>
               <button type="button" class="ant-rename-btn locked" disabled onclick="renameAntenna('A', event)" title="Connect to AD600 to rename antenna">✎</button>
             </div>
@@ -1501,7 +1655,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_A" onchange="onAntennaRangePreset('A', this.value)">
-            ${bandOptionsHtml('470_524')}
+            ${bandOptionsHtml('CUSTOM')}
           </select>
           <div id="antCustom_A" class="antenna-custom-inputs">
             <input type="number" id="customStart_A" step="0.5" value="470.0" onchange="onAntennaCustomInput('A')" oninput="onAntennaCustomInput('A')">
@@ -1529,7 +1683,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_B" onchange="onAntennaRangePreset('B', this.value)">
-            ${bandOptionsHtml('524_620')}
+            ${bandOptionsHtml('CUSTOM')}
           </select>
           <div id="antCustom_B" class="antenna-custom-inputs">
             <input type="number" id="customStart_B" step="0.5" value="524.0" onchange="onAntennaCustomInput('B')" oninput="onAntennaCustomInput('B')">
@@ -1691,7 +1845,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             </div>
           </div>
           <select id="antRangeSelect_F" onchange="onAntennaRangePreset('F', this.value)">
-            ${bandOptionsHtml('470_1000')}
+            ${bandOptionsHtml('CUSTOM')}
           </select>
           <div id="antCustom_F" class="antenna-custom-inputs">
             <input type="number" id="customStart_F" step="0.5" value="470.0" onchange="onAntennaCustomInput('F')" oninput="onAntennaCustomInput('F')">
@@ -1706,11 +1860,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="stat-label">Active Hardware IP</div>
+      <div class="stat-label">Active rtl_tcp Host</div>
       <div class="stat-value" id="targetIp">--.--.--.--</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Active Antennas</div>
+      <div class="stat-label">Enabled Receivers</div>
       <div class="stat-value" id="antennaVal">A</div>
     </div>
     <div class="stat-card">
@@ -1726,7 +1880,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   <div class="main-panel">
     <div class="panel-header">
       <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-        <strong>RF Spectrum Power Sweep (dBm)</strong>
+        <strong>RF Spectrum Power Sweep (dBFS)</strong>
+        <span id="graphBandLabels" class="graph-band-labels" aria-live="polite"></span>
         <div class="dtv-controls-group">
           <span class="dtv-label">DTV Grid:</span>
           <div class="dtv-mode-toggle">
@@ -1814,11 +1969,13 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     }
 
     function getVisibleFreqRange(c) {
-      if (!c || !c.data.labels || c.data.labels.length === 0) {
+      if (!c) {
         return (typeof computeActiveEnvelope === 'function') ? computeActiveEnvelope() : [470.0, 524.0];
       }
-      const minLabel = c.options.scales.x.min !== undefined ? c.options.scales.x.min : c.data.labels[0];
-      const maxLabel = c.options.scales.x.max !== undefined ? c.options.scales.x.max : c.data.labels[c.data.labels.length - 1];
+      const labels = c.data.labels || [];
+      const scale = c.scales && c.scales.x;
+      const minLabel = c.options.scales.x.min !== undefined ? c.options.scales.x.min : (scale ? scale.min : labels[0]);
+      const maxLabel = c.options.scales.x.max !== undefined ? c.options.scales.x.max : (scale ? scale.max : labels[labels.length - 1]);
       const minF = parseFloat(minLabel);
       const maxF = parseFloat(maxLabel);
       return [isNaN(minF) ? 470.0 : minF, isNaN(maxF) ? 524.0 : maxF];
@@ -1893,17 +2050,86 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       'J8A': [554.0, 616.0],
       'K54': [608.0, 663.0],
       'X55': [940.0, 960.0],
+      'S_G1_A': [518.0, 550.0],
+      'S_G1_B': [630.0, 662.0],
+      'S_G1_C': [740.0, 772.0],
+      'S_G1_D': [790.0, 822.0],
+      'S_G1_E': [838.0, 870.0],
+      'S_G2_A': [518.0, 554.0],
+      'S_G2_B': [626.0, 662.0],
+      'S_G2_C': [740.0, 776.0],
+      'S_G2_D': [786.0, 822.0],
+      'S_G2_E': [830.0, 866.0],
+      'S_G3_A': [516.0, 558.0],
+      'S_G3_A2': [518.0, 554.0],
+      'S_G3_G': [566.0, 608.0],
+      'S_G3_B': [626.0, 668.0],
+      'S_G3_B2': [626.0, 662.0],
+      'S_G3_C': [734.0, 776.0],
+      'S_G3_D': [780.0, 822.0],
+      'S_G3_E': [823.0, 865.0],
+      'S_G4_A1': [470.0, 516.0],
+      'S_G4_A': [516.0, 558.0],
+      'S_G4_AS': [520.0, 558.0],
+      'S_G4_G': [566.0, 608.0],
+      'S_G4_GB': [606.0, 648.0],
+      'S_G4_B': [626.0, 668.0],
+      'S_G4_C': [734.0, 776.0],
+      'S_G4_CTH': [748.2, 757.8],
+      'S_G4_D': [780.0, 822.0],
+      'S_G4_TH': [794.0, 806.0],
+      'S_G4_JB': [806.0, 810.0],
+      'S_G4_E': [823.0, 865.0],
+      'S_G4_KP': [925.0, 937.5],
+      'S_G4_AWPLUS': [470.0, 558.0],
+      'S_G4_AW30': [470.0, 558.0],
+      'S_G4_GW1': [558.0, 608.0],
+      'S_G4_GW': [558.0, 626.0],
+      'S_G4_GBW': [606.0, 678.0],
+      'S_G4_BW': [626.0, 698.0],
+      'S_G4_CW': [718.0, 790.0],
+      'S_G4_CWTH': [748.2, 757.8],
+      'S_G4_DW': [790.0, 865.0],
+      'S_2000_AW': [516.0, 558.0],
+      'S_2000_GW': [558.0, 626.0],
+      'S_2000_BW': [626.0, 698.0],
+      'S_2000_CW': [718.0, 790.0],
+      'S_2000_DW': [790.0, 865.0],
+      'S_2000_AWPLUS': [470.0, 558.0],
+      'S_2000_GW1': [558.0, 608.0],
+      'S_2000_GBW': [606.0, 678.0],
+      'S_3000_A': [470.0, 560.0],
+      'S_3000_B': [518.0, 608.0],
+      'S_3000_C': [548.0, 638.0],
+      'S_3000_D': [614.0, 704.0],
+      'S_3000_E': [678.0, 768.0],
+      'S_3000_F': [708.0, 798.0],
+      'S_3000_G': [776.0, 866.0],
+      'S_3000_H': [814.0, 904.0],
+      'S_3000_II_L': [470.0, 638.0],
+      'S_3000_II_N': [614.0, 798.0],
+      'S_3000_II_P': [776.0, 960.0],
       'A1_A4': [470.0, 558.0],
-      'A5_A8': [550.0, 608.0],
+      'A5_A8': [550.0, 638.0],
+      'S_6000_B1_B4': [630.0, 718.0],
+      'S_6000_B5_B8': [710.0, 798.0],
+      'S_EWD_Q1_6': [470.2, 526.0],
+      'S_EWD_R1_6': [520.0, 576.0],
+      'S_EWD_R4_9': [552.0, 607.8],
+      'S_EWD_S1_7': [606.2, 662.0],
+      'S_EWD_S4_7': [630.0, 662.0],
+      'S_EWD_S7_10': [662.0, 693.8],
+      'S_EWD_U1_5': [823.2, 864.8],
+      'S_EWD_V3_4': [925.2, 937.3],
       'VHF': [174.0, 216.0],
-      'AFTRCC': [1435.0, 1525.0],
       '470_524': [470.0, 524.0],
       '524_620': [524.0, 620.0],
       '608_1000': [608.0, 1000.0],
+      'AFTRCC': [1435.0, 1525.0],
       '470_1000': [470.0, 1000.0],
-      '470_2000': [470.0, 2000.0],
+      '470_1766': [470.0, 1766.0],
       '174_1000': [174.0, 1000.0],
-      'FULL_SPAN': [174.0, 2000.0]
+      'FULL_SPAN': [24.0, 1766.0]
     };
 
     let lockZoom = true;
@@ -1918,12 +2144,22 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       'F': [470.0, 1000.0]
     };
 
+    let currentRtlClients = [];
+
     function getActiveAntennas() {
       const checked = Array.from(document.querySelectorAll('input[name="antennaCb"]:checked')).map(el => el.value);
       return checked.length > 0 ? checked : ['A'];
     }
 
     function computeActiveEnvelope() {
+      const activeReceivers = currentRtlClients.filter(client => client.enabled &&
+        Number.isFinite(Number(client.startMhz)) && Number.isFinite(Number(client.stopMhz)) && Number(client.stopMhz) > Number(client.startMhz));
+      if (activeReceivers.length) {
+        return [
+          Math.min(...activeReceivers.map(client => Number(client.startMhz))),
+          Math.max(...activeReceivers.map(client => Number(client.stopMhz)))
+        ];
+      }
       const active = getActiveAntennas();
       let minStart = Infinity, maxEnd = -Infinity;
       active.forEach(ant => {
@@ -2023,16 +2259,17 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     }
 
     let syncDebounceTimer = null;
-    // push=false only redraws locally — used on page load so a newly opened viewer adopts the
-    // server's live configuration instead of re-arming the AD600 with this page's defaults.
+    // Receiver ranges are managed per profile; this helper updates the shared chart viewport only.
     function syncHardwareAndZoom(immediate = false, push = true) {
       updateCardActiveStyles();
-      const active = getActiveAntennas();
+      updateGraphBandLabels();
       const [envStart, envEnd] = computeActiveEnvelope();
 
       const ind = document.getElementById('hwSweepRangeIndicator');
       if (ind) {
-        ind.innerText = 'Hardware Sweep: ' + envStart.toFixed(1) + ' – ' + envEnd.toFixed(1) + ' MHz';
+        ind.innerText = currentRtlClients.some(client => client.enabled)
+          ? 'Enabled span: ' + envStart.toFixed(1) + ' – ' + envEnd.toFixed(1) + ' MHz'
+          : 'No receivers enabled';
       }
 
       // Immediately clear spectrum view & adjust zoom window to the new target range
@@ -2045,43 +2282,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         }
       }
 
-      const doSync = async () => {
-        localSyncPending = true;
-        try {
-          const aRes = await fetch('/api/antenna', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ antennas: active })
-          });
-          const aJson = await aRes.json();
-          if (aJson) noteOwnConfigSeq(aJson.sweepConfigSeq);
-        } catch (e) {}
-
-        try {
-          const res = await fetch('/api/range', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              perAntennaMode: true,
-              startMhz: envStart,
-              endMhz: envEnd,
-              antennaRanges: localAntennaRanges
-            })
-          });
-          const json = await res.json();
-          if (json) noteOwnConfigSeq(json.sweepConfigSeq);
-        } catch (e) {}
-        localSyncPending = false;
-      };
-
       clearTimeout(syncDebounceTimer);
-      if (!push) return;
-      localSyncPending = true;
-      if (immediate) {
-        doSync();
-      } else {
-        syncDebounceTimer = setTimeout(doSync, 200);
-      }
+      localSyncPending = false;
     }
 
     function onAntennaChange(ant) {
@@ -2124,6 +2326,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         if (partner) {
           mirrorRangeToCard(partner, val, RANGE_PRESETS[val][0], RANGE_PRESETS[val][1]);
         }
+        refreshTraceBandLabels();
         syncHardwareAndZoom(true);
       }
     }
@@ -2139,6 +2342,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           localAntennaRanges[partner] = [s, e];
           mirrorRangeToCard(partner, 'CUSTOM', s, e);
         }
+        refreshTraceBandLabels();
         syncHardwareAndZoom(false);
       }
     }
@@ -2325,6 +2529,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         localAntennaRanges[ant2] = [...r];
         mirrorRangeToCard(ant1, val, r[0], r[1]);
         mirrorRangeToCard(ant2, val, r[0], r[1]);
+        refreshTraceBandLabels();
         syncHardwareAndZoom(true);
       }
     }
@@ -2338,6 +2543,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         localAntennaRanges[ant2] = [s, e];
         mirrorRangeToCard(ant1, 'CUSTOM', s, e);
         mirrorRangeToCard(ant2, 'CUSTOM', s, e);
+        refreshTraceBandLabels();
         syncHardwareAndZoom(false);
       }
     }
@@ -2548,6 +2754,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       }
     }
 
+    function extendChartLabelsForViewport(startMhz, endMhz) {
+      // The x axis is numeric MHz, so zooming only changes its bounds. The labels remain useful
+      // to channel overlays and markers without resampling receiver traces.
+      chart.data.labels = buildBaselineLabels(startMhz, endMhz);
+    }
+
     function applyChartZoom(startMhz, endMhz) {
       if (!chart) return;
       const s = Math.min(startMhz, endMhz);
@@ -2556,8 +2768,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
       if (!hasRealData || !chart.data.labels || chart.data.labels.length === 0) {
         chart.data.labels = buildBaselineLabels(s, e);
-        chart.options.scales.x.min = chart.data.labels[0];
-        chart.options.scales.x.max = chart.data.labels[chart.data.labels.length - 1];
+        chart.options.scales.x.min = s;
+        chart.options.scales.x.max = e;
         if (!chart.data.datasets || chart.data.datasets.length === 0) {
           chart.data.datasets = [{
             label: 'Grid Baseline',
@@ -2569,16 +2781,48 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         return;
       }
 
-      const labels = chart.data.labels;
-      const firstFreq = parseFloat(labels[0]);
-      const lastFreq  = parseFloat(labels[labels.length - 1]);
-      const span = lastFreq - firstFreq;
-      if (span <= 0) return;
+      extendChartLabelsForViewport(s, e);
+      chart.options.scales.x.min = s;
+      chart.options.scales.x.max = e;
+    }
 
-      const iStart = Math.max(0, Math.round((s - firstFreq) / span * (labels.length - 1)));
-      const iEnd   = Math.min(labels.length - 1, Math.round((e - firstFreq) / span * (labels.length - 1)));
-      chart.options.scales.x.min = labels[iStart];
-      chart.options.scales.x.max = labels[iEnd];
+    function refreshTraceBandLabels() {
+      if (!chart || !Array.isArray(chart.data.datasets)) return;
+      updateGraphBandLabels();
+      ['A', 'B', 'C', 'D', 'E', 'F'].forEach(ant => {
+        const seriesLabel = ant === 'A' ? 'RTL-SDR' : 'Antenna ' + ant;
+        const select = document.getElementById('antRangeSelect_' + ant);
+        const selectedBand = select && select.value !== 'CUSTOM'
+          ? select.options[select.selectedIndex]?.textContent.split(':')[0].trim()
+          : 'Custom';
+        const range = localAntennaRanges[ant];
+        if (!range) return;
+        chart.data.datasets.forEach(dataset => {
+          if (!dataset.label || !dataset.label.startsWith(seriesLabel + ' — ')) return;
+          const maxHoldSuffix = dataset.label.endsWith(' Max Hold') ? ' Max Hold' : '';
+          dataset.label = seriesLabel + ' — ' + (selectedBand || 'Band') + ' (' +
+            range[0].toFixed(1) + '–' + range[1].toFixed(1) + ' MHz)' + maxHoldSuffix;
+        });
+      });
+      chart.update('none');
+    }
+
+    function updateGraphBandLabels() {
+      const container = document.getElementById('graphBandLabels');
+      if (!container) return;
+      const visibleLabels = [];
+      const displayedClients = currentRtlClients.filter(client => client.enabled);
+      (displayedClients.length ? displayedClients : currentRtlClients).forEach(client => {
+        const startMhz = Number(client.startMhz);
+        const stopMhz = Number(client.stopMhz);
+        if (!Number.isFinite(startMhz) || !Number.isFinite(stopMhz) || stopMhz <= startMhz) return;
+        const preset = Object.keys(RANGE_PRESETS).find(key =>
+          Math.abs(RANGE_PRESETS[key][0] - startMhz) < 0.001 && Math.abs(RANGE_PRESETS[key][1] - stopMhz) < 0.001);
+        const label = (client.slot || 'A') + ' ' + client.name + ' · ' + (preset || 'Custom') +
+          ' (' + startMhz.toFixed(1) + '–' + stopMhz.toFixed(1) + ' MHz)';
+        if (!visibleLabels.includes(label)) visibleLabels.push(label);
+      });
+      container.textContent = visibleLabels.join('  ·  ');
     }
 
     async function onRbwSelect(val) {
@@ -2594,7 +2838,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const json = await res.json();
         if (json) noteOwnConfigSeq(json.sweepConfigSeq);
       } catch (e) {
-        console.error('RBW set error:', e);
+        console.error('Spectrum bin-width update failed:', e);
       }
     }
 
@@ -2784,30 +3028,30 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           responsive: true,
           maintainAspectRatio: false,
           animation: { duration: 0 },
-          interaction: { intersect: false, mode: 'index' },
+          interaction: { intersect: false, mode: 'nearest', axis: 'x' },
           plugins: {
             legend: { display: true, labels: { color: '#8a99ad' } },
             tooltip: {
               filter: (item) => !hoveredDtvChannel,
               backgroundColor: 'rgba(18, 24, 38, 0.95)',
               callbacks: {
-                title: (items) => 'Frequency: ' + items[0].label + ' MHz',
-                label: (item) => item.dataset.label + ': ' + item.raw + ' dBm'
+                title: (items) => 'Frequency: ' + Number(items[0].parsed.x).toFixed(3) + ' MHz',
+                label: (item) => item.dataset.label + ': ' + item.parsed.y + ' dBFS'
               }
             }
           },
           scales: {
             x: {
-              min: initialLabels[0],
-              max: initialLabels[initialLabels.length - 1],
+              type: 'linear',
+              min: initStart,
+              max: initEnd,
               grid: { color: 'rgba(255, 255, 255, 0.08)' },
               ticks: {
                 color: '#8a99ad',
                 maxTicksLimit: 16,
-                callback: function(val, index) {
-                  const raw = this.getLabelForValue(val);
-                  const f = parseFloat(raw);
-                  if (isNaN(f)) return raw;
+                callback: function(val) {
+                  const f = Number(val);
+                  if (!Number.isFinite(f)) return val;
                   return (f % 1 === 0 ? f.toFixed(0) : f.toFixed(1)) + ' MHz';
                 }
               },
@@ -2815,10 +3059,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             },
             y: {
               min: -120,
-              max: -30,
+              max: 0,
               grid: { color: 'rgba(255, 255, 255, 0.06)' },
               ticks: { color: '#8a99ad', stepSize: 10 },
-              title: { display: true, text: 'Power (dBm)', color: '#8a99ad' }
+              title: { display: true, text: 'Power (dBFS)', color: '#8a99ad' }
             }
           }
         }
@@ -2861,41 +3105,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       });
     }
 
-    async function toggleConnect() {
-      const btn = document.getElementById('connectBtn');
-      const isConnected = btn && btn.classList.contains('connected');
-      const action = isConnected ? 'disconnect' : 'connect';
-
-      if (!isConnected && btn) {
-        btn.className = 'btn-connect connecting';
-        btn.innerText = 'NEGOTIATING...';
-      }
-
-      try {
-        const res = await fetch('/api/connect', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: action })
-        });
-        const data = await res.json();
-        if (btn) {
-          if (data.connectionState === 'CONNECTED') {
-            btn.className = 'btn-connect connected';
-            btn.innerText = 'CONNECTED';
-          } else if (data.connectionState === 'DISCONNECTED') {
-            btn.className = 'btn-connect';
-            btn.innerText = 'CONNECT';
-          }
-        }
-      } catch (e) {
-        console.error('Connect toggle error:', e);
-      }
-    }
-
     async function toggleScan() {
       const newAction = isScanning ? 'stop' : 'start';
       if (newAction === 'start') {
         clearSpectrumDisplay();
+        currentRtlClients.filter(client => client.enabled).forEach(client => { maxHoldBuffers[client.id] = []; });
       }
       const scansEl = document.getElementById('scansCaptured');
       if (scansEl) scansEl.innerText = '0';
@@ -2922,17 +3136,187 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       }
     }
 
-    async function onDeviceSelect(ip) {
-      if (!ip) return;
+    let renderedRtlClientSignature = '';
+    let displayedRtlClientSignature = '';
+
+    async function postRtlClientAction(payload) {
+      const message = document.getElementById('rtlClientMessage');
+      if (message) message.textContent = '';
       try {
-        await fetch('/api/target', {
+        const res = await fetch('/api/rtl-clients', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targetIp: ip })
+          body: JSON.stringify(payload)
         });
+        const data = await res.json();
+        if (!res.ok || !data.success) throw new Error(data.error || 'Could not update rtl_tcp client list');
+        if (message) message.textContent = '';
+        await fetchStatus();
+        return true;
       } catch (e) {
-        console.error('Device target set error:', e);
+        if (message) message.textContent = e.message || 'Could not update rtl_tcp client list';
+        return false;
       }
+    }
+
+    function receiverProgressText(client) {
+      const progress = client && client.progress;
+      if (!progress) return '';
+      return 'Sweep ' + progress.percent.toFixed(0) + '% · ' +
+        (progress.centerHz / 1e6).toFixed(1) + ' MHz · ' + progress.elapsedSeconds.toFixed(1) + ' s';
+    }
+
+    function renderRtlClients(clients) {
+      const list = document.getElementById('rtlClientList');
+      if (!list) return;
+      currentRtlClients = clients;
+      list.querySelectorAll('[data-progress-client]').forEach(element => {
+        const client = clients.find(item => item.id === element.dataset.progressClient);
+        element.textContent = receiverProgressText(client);
+      });
+      const signature = JSON.stringify(clients.map(client => [client.id, client.name, client.host, client.port,
+        client.startMhz, client.stopMhz, client.slot, client.color, client.enabled, client.state, client.error]));
+      if (signature === renderedRtlClientSignature) return;
+      renderedRtlClientSignature = signature;
+      list.replaceChildren();
+
+      clients.forEach(client => {
+        const card = document.createElement('div');
+        card.className = 'rtl-client-card';
+        card.style.setProperty('--receiver-color', client.color || ANT_COLORS[client.slot] || ANT_COLORS.A);
+
+        const head = document.createElement('div');
+        head.className = 'rtl-client-card-head';
+
+        const main = document.createElement('label');
+        main.className = 'rtl-client-main';
+        const enabled = document.createElement('input');
+        enabled.type = 'checkbox';
+        enabled.checked = !!client.enabled;
+        enabled.setAttribute('aria-label', 'Enable ' + client.name);
+        enabled.addEventListener('change', () => postRtlClientAction({
+          action: 'setEnabled', id: client.id, enabled: enabled.checked
+        }));
+
+        const meta = document.createElement('span');
+        meta.className = 'rtl-client-meta';
+        const slot = document.createElement('span');
+        slot.className = 'rtl-client-slot';
+        slot.style.color = client.color || ANT_COLORS[client.slot] || ANT_COLORS.A;
+        slot.textContent = client.slot || 'A';
+        const name = document.createElement('span');
+        name.className = 'rtl-client-name';
+        name.textContent = client.name;
+        const endpoint = document.createElement('span');
+        endpoint.className = 'rtl-client-endpoint';
+        endpoint.textContent = (client.host.includes(':') ? '[' + client.host + ']' : client.host) + ':' + client.port;
+        const state = document.createElement('span');
+        state.className = 'rtl-client-state' + (client.state === 'CONNECTED' ? ' connected' : (client.state === 'ERROR' ? ' error' : ''));
+        state.textContent = client.error ? ('Error: ' + client.error) : (client.state === 'RECONNECTING' ? 'Reconnecting' : (client.state || 'DISCONNECTED'));
+        if (client.error) state.classList.add('error');
+        const progress = document.createElement('span');
+        progress.className = 'rtl-client-endpoint';
+        progress.dataset.progressClient = client.id;
+        progress.textContent = receiverProgressText(client);
+        meta.append(name, endpoint, state, progress);
+        main.append(enabled, slot, meta);
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'rtl-client-remove';
+        remove.textContent = client.id === 'rtl-client-1' ? 'Default' : 'Remove';
+        remove.disabled = client.id === 'rtl-client-1';
+        remove.title = client.id === 'rtl-client-1' ? 'Disable the default endpoint to stop using it' : 'Remove this rtl_tcp client';
+        remove.addEventListener('click', () => postRtlClientAction({ action: 'remove', id: client.id }));
+
+        head.append(main, remove);
+
+        const startMhz = Number(client.startMhz || 470);
+        const stopMhz = Number(client.stopMhz || 524);
+        const preset = Object.keys(RANGE_PRESETS).find(key =>
+          Math.abs(RANGE_PRESETS[key][0] - startMhz) < 0.001 && Math.abs(RANGE_PRESETS[key][1] - stopMhz) < 0.001) || 'CUSTOM';
+        const rangeSelect = document.createElement('select');
+        rangeSelect.className = 'rtl-client-range-select';
+        rangeSelect.setAttribute('aria-label', client.name + ' frequency range');
+        rangeSelect.innerHTML = ${JSON.stringify(bandOptionsHtml('CUSTOM'))};
+        rangeSelect.value = preset;
+        const customRange = document.createElement('div');
+        customRange.className = 'rtl-client-custom-range';
+        customRange.hidden = preset !== 'CUSTOM';
+        const customStart = document.createElement('input');
+        customStart.type = 'number';
+        customStart.min = '24';
+        customStart.max = '1765.9';
+        customStart.step = '0.1';
+        customStart.value = startMhz.toFixed(1);
+        customStart.setAttribute('aria-label', client.name + ' scan start MHz');
+        const separator = document.createElement('span');
+        separator.textContent = '–';
+        const customStop = document.createElement('input');
+        customStop.type = 'number';
+        customStop.min = '24.1';
+        customStop.max = '1766';
+        customStop.step = '0.1';
+        customStop.value = stopMhz.toFixed(1);
+        customStop.setAttribute('aria-label', client.name + ' scan stop MHz');
+        const mhz = document.createElement('span');
+        mhz.textContent = 'MHz';
+        const applyRange = document.createElement('button');
+        applyRange.type = 'button';
+        applyRange.className = 'btn-scan';
+        applyRange.textContent = 'APPLY';
+        applyRange.addEventListener('click', () => setRtlClientRange(client.id, customStart.value, customStop.value));
+        customRange.append(customStart, separator, customStop, mhz, applyRange);
+        rangeSelect.addEventListener('change', () => {
+          if (rangeSelect.value === 'CUSTOM') {
+            customRange.hidden = false;
+            return;
+          }
+          const range = RANGE_PRESETS[rangeSelect.value];
+          if (range) setRtlClientRange(client.id, range[0], range[1]);
+        });
+        card.append(head, rangeSelect, customRange);
+        list.appendChild(card);
+      });
+
+      const atLimit = clients.length >= 6;
+      const form = document.getElementById('rtlClientForm');
+      if (form) {
+        form.querySelectorAll('input, button').forEach(input => { input.disabled = atLimit; });
+        form.title = atLimit ? 'The AD600 has six antenna slots' : '';
+      }
+    }
+
+    async function setRtlClientRange(id, startMhz, stopMhz) {
+      const start = Number.parseFloat(startMhz);
+      const stop = Number.parseFloat(stopMhz);
+      if (!Number.isFinite(start) || !Number.isFinite(stop) || start < 24 || stop > 1766 || stop <= start) {
+        const message = document.getElementById('rtlClientMessage');
+        if (message) message.textContent = 'Enter a valid range from 24 to 1766 MHz';
+        return;
+      }
+      maxHoldBuffers[id] = [];
+      await postRtlClientAction({ action: 'setRange', id, startMhz: start, stopMhz: stop });
+      syncHardwareAndZoom(true, false);
+    }
+
+    async function addRtlClient(event) {
+      event.preventDefault();
+      const payload = {
+        action: 'add',
+        name: document.getElementById('rtlClientName').value,
+        host: document.getElementById('rtlClientHost').value,
+        port: document.getElementById('rtlClientPort').value
+      };
+      if (await postRtlClientAction(payload)) {
+        document.getElementById('rtlClientName').value = 'RTL-SDR';
+        document.getElementById('rtlClientHost').value = '';
+        document.getElementById('rtlClientPort').value = '1234';
+      }
+    }
+
+    function clientColor(client) {
+      return client.color || ANT_COLORS[client.slot] || ANT_COLORS.A;
     }
 
     async function fetchStatus() {
@@ -2942,7 +3326,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const data = await res.json();
 
         const isConnected = data.connectionState === 'CONNECTED';
-        const isConnecting = data.connectionState === 'CONNECTING';
+        renderRtlClients(data.rtlClients || []);
 
         const statusEl = document.getElementById('statusText');
         if (statusEl) {
@@ -2950,18 +3334,24 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         }
 
         document.body.classList.toggle('view-only', data.controlAllowed === false);
+        const enabledClientSignature = (data.rtlClients || []).filter(client => client.enabled).map(client => client.id).join('|');
+        if (enabledClientSignature !== displayedRtlClientSignature) {
+          displayedRtlClientSignature = enabledClientSignature;
+          currentRtlClients.forEach(client => { maxHoldBuffers[client.id] = []; });
+          syncHardwareAndZoom(true, false);
+        }
         if (!localSyncPending && (data.sweepConfigSeq || 0) > knownConfigSeq) {
           applyServerConfig(data);
           updateCardActiveStyles();
           syncHardwareAndZoom(true, false);
         }
         document.getElementById('targetIp').innerText = data.activeTargetIp || '--.--.--.--';
-        document.getElementById('antennaVal').innerText = (data.selectedAntennas || ['A']).join(', ');
+        document.getElementById('antennaVal').innerText = String((data.rtlClients || []).filter(client => client.enabled).length);
         document.getElementById('scansCaptured').innerText = data.scansCaptured;
 
         const grid = data.grid || { startHz: 470000000, stopHz: 524000000, stepHz: 350000, pointCount: 155 };
         const rbwKhz = Math.round((grid.stepHz || 350000) / 1000);
-        document.getElementById('resVal').innerText = rbwKhz + ' kHz (' + (grid.pointCount || 155) + ' Pts)';
+        document.getElementById('resVal').innerText = rbwKhz + ' kHz bins (' + (grid.pointCount || 155) + ' Pts)';
 
         const rbwSelect = document.getElementById('rbwSelect');
         if (rbwSelect && data.rbwHz && rbwSelect.value != data.rbwHz) {
@@ -2981,49 +3371,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
               ifaceSelect.appendChild(opt);
             }
           });
-        }
-
-        // Sync Discovered Devices dropdown
-        const select = document.getElementById('deviceSelect');
-        const devs = Object.values(data.discoveredDevices || {});
-        select.innerHTML = '';
-        if (devs.length === 0) {
-          const opt = document.createElement('option');
-          opt.value = '';
-          opt.innerText = '-- No Device Selected (Searching...) --';
-          select.appendChild(opt);
-        } else {
-          devs.forEach(dev => {
-            const opt = document.createElement('option');
-            opt.value = dev.ip;
-            opt.innerText = dev.model + ' (' + dev.ip + ' - ' + (dev.iface || 'NIC') + ')';
-            if (dev.ip === data.activeTargetIp) opt.selected = true;
-            select.appendChild(opt);
-          });
-        }
-
-        // Sync Connect Button state
-        const connectBtn = document.getElementById('connectBtn');
-        if (connectBtn) {
-          const connState = data.connectionState || 'DISCONNECTED';
-          if (connState === 'CONNECTED') {
-            connectBtn.className = 'btn-connect connected';
-            if (!connectBtn.matches(':hover')) {
-              connectBtn.innerText = 'CONNECTED';
-            }
-            connectBtn.disabled = false;
-            connectBtn.title = 'Connected & claimed on AD600. Click to Disconnect.';
-          } else if (connState === 'CONNECTING') {
-            connectBtn.className = 'btn-connect connecting';
-            connectBtn.innerText = 'NEGOTIATING...';
-            connectBtn.disabled = false;
-            connectBtn.title = 'Negotiating ACN/SDT connection with AD600...';
-          } else {
-            connectBtn.className = 'btn-connect';
-            connectBtn.innerText = 'CONNECT';
-            connectBtn.disabled = !data.activeTargetIp;
-            connectBtn.title = data.activeTargetIp ? 'Connect & Negotiate with Shure AD600' : 'Select Target Device first';
-          }
         }
 
         // Sync Antenna Rename Buttons (locked until connected)
@@ -3095,13 +3442,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         // Sync Scan Button state
         const btn = document.getElementById('scanBtn');
-        const hasDevice = !!data.activeTargetIp;
+        const activeClients = (data.rtlClients || []).filter(client => client.enabled);
+        const hasDevice = activeClients.length > 0;
         isScanning = data.scanState === 'SCANNING';
 
         if (!hasDevice) {
           btn.disabled = true;
           btn.className = 'btn-scan btn-disabled';
-          btn.innerText = 'SELECT TARGET DEVICE TO SCAN';
+          btn.innerText = 'ENABLE A RECEIVER TO SCAN';
         } else if (isScanning) {
           btn.disabled = false;
           btn.className = 'btn-stop';
@@ -3124,95 +3472,98 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           document.getElementById('lastUpdate').innerText = 'Last Sweep: ' + d.toLocaleTimeString();
         }
 
-        const activeKeys = data.selectedAntennas || ['A'];
+        const activeKeys = activeClients.map(client => client.id);
+        const rtlClientById = new Map(activeClients.map(client => [client.id, client]));
 
         if (data.traces) {
-          const startMhz = (grid.startHz || 470000000) / 1e6;
-          const stepMhz = (grid.stepHz || 350000) / 1e6;
-          let totalPoints = grid.pointCount || 0;
-          for (const k of activeKeys) {
-            if (data.traces[k] && data.traces[k].length > totalPoints) {
-              totalPoints = data.traces[k].length;
-            }
-          }
-          if (totalPoints === 0) totalPoints = 395;
-
-          // Check if any antenna has real data and is not in a re-arm or config transition.
+          // Plot every rtl_tcp receiver on a numeric MHz axis so different ranges and bin grids
+          // retain their actual frequency positions.
           const isReArming = (data.status && data.status.includes('RE-ARMING'));
           const isPendingSeq = targetConfigSeq > 0 && (data.sweepConfigSeq === undefined || data.sweepConfigSeq < targetConfigSeq);
           const hasAnyData = !isReArming && !isPendingSeq && activeKeys.some(ant => data.traces[ant] && data.traces[ant].length > 0);
 
           if (hasAnyData) {
             needsTraceWipe = false;
-            const labels = [];
-            for (let i = 0; i < totalPoints; i++) {
-              const freq = startMhz + i * stepMhz;
-              labels.push(freq.toFixed(3));
-            }
-            chart.data.labels = labels;
+            const [envelopeStart, envelopeEnd] = computeActiveEnvelope();
+            chart.data.labels = buildBaselineLabels(envelopeStart, envelopeEnd);
 
             // Re-build multi-series datasets for Chart.js with phosphor persistence and Max Hold
             const newDatasets = [];
-            activeKeys.forEach(ant => {
-              const raw = data.traces[ant] || [];
-              const antRange = localAntennaRanges[ant] || [startMhz, startMhz + totalPoints * stepMhz];
-              const existingDs = chart.data.datasets && chart.data.datasets.find(d => d.label && d.label.startsWith('Antenna ' + ant) && !d.label.includes('Max Hold'));
-              const existingPts = existingDs ? existingDs.data : [];
+            activeKeys.forEach(clientId => {
+              const client = rtlClientById.get(clientId) || {};
+              const raw = data.traces[clientId] || [];
+              const clientGrid = client.grid || grid;
+              const startMhz = clientGrid.startHz / 1e6;
+              const stopMhz = clientGrid.stopHz / 1e6;
+              const stepMhz = clientGrid.stepHz / 1e6;
+              const seriesLabel = client.name || 'RTL-SDR';
+              const existingDs = chart.data.datasets && chart.data.datasets.find(d => d.clientId === clientId && !d.label.includes('Max Hold'));
+              const existingValuesByFrequency = new Map();
+              if (existingDs && Array.isArray(existingDs.data)) {
+                existingDs.data.forEach(point => {
+                  if (point && Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y))) {
+                    existingValuesByFrequency.set(Number(point.x).toFixed(3), point.y);
+                  }
+                });
+              }
+              const endpoint = client.host.includes(':') ? '[' + client.host + ']' : client.host;
+              const traceLabel = (client.slot || '') + ' · ' + seriesLabel + ' (' + endpoint + ':' + client.port + ') — ' +
+                startMhz.toFixed(1) + '–' + stopMhz.toFixed(1) + ' MHz';
 
               const pts = [];
-              for (let i = 0; i < totalPoints; i++) {
-                const freq = startMhz + i * stepMhz;
-                if (freq >= antRange[0] - 0.001 && freq <= antRange[1] + 0.001) {
-                  const val = raw[i];
-                  // If new data is valid (> -125 dBm), use it; otherwise retain existing on-screen point
-                  if (val !== undefined && val !== null && val > -125.0) {
-                    pts.push(val);
-                  } else if (existingPts && existingPts[i] !== undefined && existingPts[i] !== null && existingPts[i] > -125.0) {
-                    pts.push(existingPts[i]);
-                  } else {
-                    pts.push(val !== undefined ? val : -115.0);
-                  }
+              const maxPts = [];
+              if (maxHoldActive[clientId] && (!maxHoldBuffers[clientId] || maxHoldBuffers[clientId].length !== raw.length)) {
+                maxHoldBuffers[clientId] = new Array(raw.length).fill(null);
+              }
+              for (let i = 0; i < raw.length; i++) {
+                const frequencyMhz = startMhz + i * stepMhz;
+                const frequency = frequencyMhz.toFixed(3);
+                const val = raw[i];
+                const previousValue = existingValuesByFrequency.get(frequency);
+                let traceValue;
+                // Keep the previous point for an empty or below-floor dBFS bin.
+                if (val !== undefined && val !== null && val > -125.0) {
+                  traceValue = val;
+                } else if (previousValue !== undefined && previousValue !== null && previousValue > -125.0) {
+                  traceValue = previousValue;
                 } else {
-                  pts.push(null); // clipped out of this antenna's assigned window
+                  traceValue = val !== undefined ? val : -115.0;
+                }
+                pts.push({ x: frequencyMhz, y: traceValue });
+                if (maxHoldActive[clientId]) {
+                  const prev = maxHoldBuffers[clientId][i];
+                  const peak = (prev === null || prev === undefined) ? traceValue : Math.max(prev, traceValue);
+                  maxHoldBuffers[clientId][i] = peak;
+                  maxPts.push({ x: frequencyMhz, y: peak });
                 }
               }
 
               // 1. Live Instantaneous Trace
               newDatasets.push({
-                label: 'Antenna ' + ant + ' (' + antRange[0].toFixed(1) + '–' + antRange[1].toFixed(1) + ' MHz)',
+                clientId,
+                label: traceLabel,
                 data: pts,
-                borderColor: ANT_COLORS[ant] || '#00ffaa',
+                borderColor: clientColor(client),
                 borderWidth: 1.5,
                 tension: 0.1,
                 spanGaps: false,
-                pointRadius: 0
+                pointRadius: 0,
+                parsing: false
               });
 
-              // 2. Max Hold Peak Trace (if enabled for this antenna)
-              if (maxHoldActive[ant]) {
-                if (!maxHoldBuffers[ant] || maxHoldBuffers[ant].length !== totalPoints) {
-                  maxHoldBuffers[ant] = new Array(totalPoints).fill(null);
-                }
-                const maxPts = [];
-                for (let i = 0; i < totalPoints; i++) {
-                  if (pts[i] !== null && pts[i] !== undefined) {
-                    const prev = maxHoldBuffers[ant][i];
-                    const peak = (prev === null || prev === undefined) ? pts[i] : Math.max(prev, pts[i]);
-                    maxHoldBuffers[ant][i] = peak;
-                    maxPts.push(peak);
-                  } else {
-                    maxPts.push(null);
-                  }
-                }
+              // 2. Max Hold Peak Trace (if enabled for this receiver)
+              if (maxHoldActive[clientId]) {
                 newDatasets.push({
-                  label: 'Antenna ' + ant + ' Max Hold',
+                  clientId,
+                  label: traceLabel + ' Max Hold',
                   data: maxPts,
-                  borderColor: ANT_COLORS[ant] || '#00ffaa',
+                  borderColor: clientColor(client),
                   borderWidth: 1.2,
                   borderDash: [4, 4],
                   tension: 0.1,
                   spanGaps: false,
-                  pointRadius: 0
+                  pointRadius: 0,
+                  parsing: false
                 });
               }
             });
@@ -3227,8 +3578,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             const hasRealData = chart.data.datasets && chart.data.datasets.some(d => d.data && d.data.length > 0 && !d.label.includes('Grid Baseline'));
             if (needsTraceWipe || !hasRealData) {
               chart.data.labels = buildBaselineLabels(curTargetStart, curTargetEnd);
-              chart.options.scales.x.min = chart.data.labels[0];
-              chart.options.scales.x.max = chart.data.labels[chart.data.labels.length - 1];
+              chart.options.scales.x.min = curTargetStart;
+              chart.options.scales.x.max = curTargetEnd;
               chart.data.datasets = [{
                 label: 'Grid Baseline',
                 data: [],
@@ -3265,9 +3616,18 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         Object.keys(ranges).forEach(ant => {
           const r = ranges[ant];
           if (!Array.isArray(r) || r.length !== 2) return;
-          const presetKey = Object.keys(RANGE_PRESETS).find(k => RANGE_PRESETS[k][0] === r[0] && RANGE_PRESETS[k][1] === r[1]);
+          const currentPreset = document.getElementById('antRangeSelect_' + ant)?.value;
+          const currentRange = localAntennaRanges[ant];
+          const sameRange = currentRange && Math.abs(currentRange[0] - r[0]) < 0.001 && Math.abs(currentRange[1] - r[1]) < 0.001;
+          const currentPresetRange = RANGE_PRESETS[currentPreset];
+          const currentPresetMatches = currentPreset === 'CUSTOM' || (currentPresetRange &&
+            Math.abs(currentPresetRange[0] - r[0]) < 0.001 && Math.abs(currentPresetRange[1] - r[1]) < 0.001);
+          const presetKey = sameRange && currentPresetMatches
+            ? currentPreset
+            : Object.keys(RANGE_PRESETS).find(k => RANGE_PRESETS[k][0] === r[0] && RANGE_PRESETS[k][1] === r[1]);
           mirrorRangeToCard(ant, presetKey || 'CUSTOM', r[0], r[1]);
         });
+        refreshTraceBandLabels();
         knownConfigSeq = Math.max(knownConfigSeq, data.sweepConfigSeq || 0);
     }
 
@@ -3285,20 +3645,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       updateCardActiveStyles();
       syncHardwareAndZoom(true, false);
 
-      const cBtn = document.getElementById('connectBtn');
-      if (cBtn) {
-        cBtn.addEventListener('mouseenter', () => {
-          if (cBtn.classList.contains('connected')) {
-            cBtn.innerText = 'DISCONNECT';
-          }
-        });
-        cBtn.addEventListener('mouseleave', () => {
-          if (cBtn.classList.contains('connected')) {
-            cBtn.innerText = 'CONNECTED';
-          }
-        });
-      }
-
       fetchStatus();
       setInterval(fetchStatus, 200); // 5 Hz poll
     });
@@ -3307,9 +3653,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 </html>`;
 
 // 4. HTTP Web Server
-// Set AD600_REMOTE_CONTROL=0 to make every other device on the LAN view-only (only the host
-// computer can connect, change ranges, or switch antenna bias). Default keeps full remote control.
-const REMOTE_CONTROL = process.env.AD600_REMOTE_CONTROL !== '0';
+// Set RTL_REMOTE_CONTROL=0 to make every other device on the LAN view-only. Local controls remain enabled.
+const REMOTE_CONTROL = process.env.RTL_REMOTE_CONTROL !== '0' && process.env.AD600_REMOTE_CONTROL !== '0';
 const CHART_JS_LOCAL = path.join(__dirname, 'vendor', 'chart.umd.min.js');
 const CHART_JS_CDN = 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js';
 
@@ -3329,7 +3674,7 @@ function startWebServer() {
     }
     if (req.url === '/api/status' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      const payload = Object.assign({}, appState, { traces: antennaTraces, controlAllowed });
+      const payload = Object.assign({}, appState, { traces: sourceTraces, rtlClients: rtlClientsForStatus(), controlAllowed });
       res.end(JSON.stringify(payload));
     } else if (urlPath === '/vendor/chart.umd.min.js' && req.method === 'GET') {
       // Served locally when vendored (works on a show network with no internet), else the CDN.
@@ -3342,28 +3687,157 @@ function startWebServer() {
         res.writeHead(200, { 'Content-Type': 'application/javascript', 'Cache-Control': 'max-age=86400' });
         res.end(data);
       });
+    } else if (urlPath === '/api/rtl-clients' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        try {
+          const payload = JSON.parse(body || '{}');
+          if (payload.action === 'add') {
+            if (appState.rtlClients.length >= RTL_CLIENT_LIMIT) {
+              res.writeHead(409, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Maximum of six receivers reached (one per AD600 antenna slot)' }));
+              return;
+            }
+            const name = String(payload.name || '').trim().slice(0, 64);
+            const host = String(payload.host || '').trim();
+            const port = Number.parseInt(payload.port, 10);
+            if (!name || /[\u0000-\u001f\u007f]/.test(name) || !host || /\s/.test(host) || host.length > 253 ||
+                !Number.isInteger(port) || port < 1 || port > 65535) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Enter a name, host without spaces, and a port from 1 to 65535' }));
+              return;
+            }
+            if (appState.rtlClients.some(client => client.host.toLowerCase() === host.toLowerCase() && client.port === port)) {
+              res.writeHead(409, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'That rtl_tcp host and port are already in the list' }));
+              return;
+            }
+            const client = {
+              id: `rtl-${crypto.randomUUID()}`,
+              name,
+              host,
+              port,
+              startMhz: RTL_SLOT_RANGES[RTL_SLOTS[appState.rtlClients.length] || 'F'][0],
+              stopMhz: RTL_SLOT_RANGES[RTL_SLOTS[appState.rtlClients.length] || 'F'][1],
+              enabled: false,
+              state: 'DISCONNECTED'
+            };
+            appState.rtlClients.push(client);
+            sourceTraces[client.id] = [];
+            if (!saveRtlClientProfiles()) {
+              appState.rtlClients = appState.rtlClients.filter(item => item.id !== client.id);
+              delete sourceTraces[client.id];
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Could not save receiver profile on this host' }));
+              return;
+            }
+          } else {
+            const client = appState.rtlClients.find(item => item.id === payload.id);
+            if (!client) {
+              res.writeHead(404, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'rtl_tcp client not found' }));
+              return;
+            }
+            if (payload.action === 'setRange') {
+              const startMhz = Number.parseFloat(payload.startMhz);
+              const stopMhz = Number.parseFloat(payload.stopMhz);
+              if (!Number.isFinite(startMhz) || !Number.isFinite(stopMhz) || startMhz < 24 || stopMhz > 1766 || stopMhz <= startMhz) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'RTL-SDR scan range must be within 24 to 1766 MHz' }));
+                return;
+              }
+              const previousRange = clientRange(client);
+              const rangeChanged = previousRange[0] !== startMhz || previousRange[1] !== stopMhz;
+              if (rangeChanged) {
+                client.startMhz = startMhz;
+                client.stopMhz = stopMhz;
+                sourceTraces[client.id] = [];
+                const runtime = rtlClientRuntimes.get(client.id);
+                const nextGrid = gridForRange(startMhz, stopMhz, appState.rbwHz);
+                if (!saveRtlClientProfiles()) {
+                  client.startMhz = previousRange[0];
+                  client.stopMhz = previousRange[1];
+                  sourceTraces[client.id] = [];
+                  res.writeHead(500, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: false, error: 'Could not save receiver frequency range on this host' }));
+                  return;
+                }
+                appState.sweepConfigSeq = (appState.sweepConfigSeq || 0) + 1;
+                if (runtime) {
+                  runtime.grid = nextGrid;
+                  runtime.lastProcessedSweepId = -1;
+                  runtime.lastSweepComplete = false;
+                  const configuration = { startHz: nextGrid.startHz, stopHz: nextGrid.stopHz, rbwHz: appState.rbwHz };
+                  if (appState.scanState === 'SCANNING') restartRtlSweep(runtime, configuration);
+                  else requestBridge(runtime, '/configuration', configuration);
+                }
+              }
+            } else if (payload.action === 'setEnabled') {
+              client.enabled = !!payload.enabled;
+              delete client.error;
+              if (client.enabled) {
+                sourceTraces[client.id] = [];
+                startRtlTcpClient(client);
+              } else {
+                stopRtlTcpClient(client.id);
+                if (enabledRtlClients().length === 0 && appState.scanState === 'SCANNING') {
+                  appState.scanState = 'STOPPED';
+                  broadcastBridgeRequest('/sweep/stop');
+                }
+              }
+            } else if (payload.action === 'remove') {
+              if (client.id === 'rtl-client-1') {
+                res.writeHead(409, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Disable the default receiver instead of removing it' }));
+                return;
+              }
+              const clientIndex = appState.rtlClients.indexOf(client);
+              stopRtlTcpClient(client.id);
+              appState.rtlClients = appState.rtlClients.filter(item => item.id !== client.id);
+              delete sourceTraces[client.id];
+              if (!saveRtlClientProfiles()) {
+                appState.rtlClients.splice(clientIndex, 0, Object.assign({}, client, { enabled: false, state: 'DISCONNECTED' }));
+                sourceTraces[client.id] = [];
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Could not save receiver profile changes on this host' }));
+                return;
+              }
+              if (enabledRtlClients().length === 0 && appState.scanState === 'SCANNING') {
+                appState.scanState = 'STOPPED';
+                broadcastBridgeRequest('/sweep/stop');
+              }
+            } else {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Action must be add, setRange, setEnabled, or remove' }));
+              return;
+            }
+          }
+          syncRtlConnectionState();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, rtlClients: rtlClientsForStatus(), connectionState: appState.connectionState }));
+        } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Invalid JSON request' }));
+        }
+      });
     } else if (req.url === '/api/connect' && req.method === 'POST') {
       let body = '';
       req.on('data', chunk => body += chunk);
       req.on('end', () => {
         try {
           const payload = JSON.parse(body);
-          if (payload.action === 'connect') {
-            if (appState.connectionState === 'DISCONNECTED') {
-              appState.connectionState = 'CONNECTING';
-              appState.status = `CONNECTING TO AD600 @ ${appState.activeTargetIp || '?'} (TAKES ~20-30 s)...`;
-              start18EngineScan();
-            } else if (appState.connectionState === 'CONNECTED') {
-              requestBiasRefresh();
-            }
-          } else if (payload.action === 'disconnect') {
-            appState.connectionState = 'DISCONNECTED';
-            appState.scanState = 'STOPPED';
-            appState.status = 'DISCONNECTED FROM AD600';
-            stop18EngineScan();
+          const client = appState.rtlClients.find(item => item.id === payload.id) || appState.rtlClients[0];
+          if (client && payload.action === 'connect') {
+            client.enabled = true;
+            startRtlTcpClient(client);
+          } else if (client && payload.action === 'disconnect') {
+            client.enabled = false;
+            stopRtlTcpClient(client.id);
           }
+          syncRtlConnectionState();
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, connectionState: appState.connectionState }));
+          res.end(JSON.stringify({ success: true, rtlClients: rtlClientsForStatus(), connectionState: appState.connectionState }));
         } catch (e) {
           res.writeHead(400); res.end();
         }
@@ -3375,27 +3849,31 @@ function startWebServer() {
         try {
           const payload = JSON.parse(body);
           if (payload.action === 'start') {
-            appState.scanState = 'SCANNING';
-            appState.scansCaptured = 0;
-            lastProcessedSweepId = -1;
-            antennaTraces = { A: [], B: [], C: [], D: [], E: [], F: [] };
-            appState.traces = antennaTraces;
-            if (!engineProcess || appState.connectionState === 'DISCONNECTED') {
-              appState.connectionState = 'CONNECTING';
-              appState.status = `CONNECTING TO AD600 @ ${appState.activeTargetIp || '?'} (FIRST SWEEP IN ~30 s)...`;
-              start18EngineScan();
-            } else {
-              appState.status = appState.scanMode === 'SINGLE'
-                ? 'STARTING SINGLE SWEEP...'
-                : (appState.scanSlotOwned ? 'STARTING CONTINUOUS SCAN...' : 'WAITING FOR SCAN SLOT / FIRST SWEEP...');
-              http.get(`http://127.0.0.1:${BRIDGE_PORT}/sweep/start`, () => {}).on('error', () => {});
+            if (enabledRtlClients().length === 0) {
+              res.writeHead(409, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ success: false, error: 'Enable at least one rtl_tcp client before starting a scan' }));
+              return;
             }
+            appState.scanState = 'SCANNING';
+            clearSourceTraces();
+            for (const client of enabledRtlClients()) {
+              const existingRuntime = rtlClientRuntimes.get(client.id);
+              if (existingRuntime) {
+                restartRtlSweep(existingRuntime);
+              } else {
+                startRtlTcpClient(client);
+              }
+            }
+            syncRtlConnectionState();
           } else {
             appState.scanState = 'STOPPED';
-            appState.scansCaptured = 0;
-            lastProcessedSweepId = -1;
-            appState.status = 'SCAN STOPPED (CONNECTED - READY)';
-            http.get(`http://127.0.0.1:${BRIDGE_PORT}/sweep/stop`, () => {}).on('error', () => {});
+            for (const runtime of rtlClientRuntimes.values()) {
+              runtime.commandEpoch++;
+              runtime.pendingSweepStart = false;
+              runtime.progress = null;
+            }
+            broadcastBridgeRequest('/sweep/stop');
+            syncRtlConnectionState();
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, scanState: appState.scanState, scansCaptured: appState.scansCaptured }));
@@ -3433,48 +3911,34 @@ function startWebServer() {
             }
           }
 
+          if (Number.isFinite(startMhz) && Number.isFinite(endMhz) &&
+              (startMhz < 24 || endMhz > 1766)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'RTL-SDR scan range must be within 24 to 1766 MHz' }));
+            return;
+          }
+
           if (!isNaN(startMhz) && !isNaN(endMhz) && endMhz > startMhz) {
             const rangeChanged = (appState.startFreqMhz !== startMhz || appState.endFreqMhz !== endMhz);
             appState.startFreqMhz = startMhz;
             appState.endFreqMhz = endMhz;
+            appState.grid = gridForRange(startMhz, endMhz, appState.rbwHz);
             appState.sweepConfigSeq = (appState.sweepConfigSeq || 0) + 1;
-            console.log(`[RANGE CONFIG] Setting Hardware Sweep Range to ${startMhz} – ${endMhz} MHz (PerAntenna=${appState.perAntennaMode}, seq=${appState.sweepConfigSeq})`);
+            console.log(`[RANGE CONFIG] Setting RTL-SDR scan range to ${startMhz} – ${endMhz} MHz (seq=${appState.sweepConfigSeq})`);
 
-            if (appState.scanState === 'SCANNING') {
-              antennaTraces = { A: [], B: [], C: [], D: [], E: [], F: [] };
-              appState.traces = antennaTraces;
-              lastProcessedSweepId = -1;
-              appState.scansCaptured = 0;
-              appState.status = `RE-ARMING SPECTRUM SCAN (${startMhz.toFixed(1)}–${endMhz.toFixed(1)} MHz)...`;
+            if (rangeChanged) {
+              clearSourceTraces();
+              if (appState.scanState === 'SCANNING') {
+                appState.status = `UPDATING RTL-SDR SCAN RANGE (${startMhz.toFixed(1)}–${endMhz.toFixed(1)} MHz)...`;
+              }
             }
 
-            const postData = JSON.stringify({
+            broadcastBridgeRequest('/configuration', {
               startHz: Math.round(startMhz * 1e6),
               stopHz: Math.round(endMhz * 1e6),
               curveMask: computeCurveMask(appState.selectedAntennas),
               repeat: appState.scanMode === 'SINGLE' ? 1 : 255
-            });
-            const bridgeReq = http.request({
-              hostname: '127.0.0.1',
-              port: BRIDGE_PORT,
-              path: '/configuration',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            }, (bridgeRes) => {
-              let resData = '';
-              bridgeRes.on('data', c => resData += c);
-              bridgeRes.on('end', () => {
-                console.log(`[BRIDGE CONFIG RESPONSE] Range updated: ${resData}`);
-              });
-            });
-            bridgeReq.on('error', err => {
-              console.log(`[BRIDGE CONFIG OFFLINE] Will apply on next scan launch: ${err.message}`);
-            });
-            bridgeReq.write(postData);
-            bridgeReq.end();
+            }, (_res, response) => console.log(`[BRIDGE CONFIG RESPONSE] Range updated: ${response}`));
           }
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3497,52 +3961,38 @@ function startWebServer() {
         try {
           const payload = JSON.parse(body);
           const rbw = parseInt(payload.rbwHz, 10);
-          // 25 kHz (comp 1) is excluded: verified live to reproducibly return corrupted
-          // amplitudes (a decode bug in ad600_native.py's RF_SCAN_DATA parser, not a hardware
-          // limit) — 50 kHz is the lowest RBW confirmed to stream clean data.
-          const VALID_RBWS = [50000, 100000, 350000, 900000];
-          if (!VALID_RBWS.includes(rbw)) {
+          // Keep the output-bin widths aligned with the Python spectrum bridge.
+          const VALID_BIN_WIDTHS = [50000, 100000, 350000, 900000];
+          if (!VALID_BIN_WIDTHS.includes(rbw)) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ success: false, error: `Unsupported RBW; valid values: ${VALID_RBWS.join(', ')} Hz` }));
+            res.end(JSON.stringify({ success: false, error: `Unsupported bin width; valid values: ${VALID_BIN_WIDTHS.join(', ')} Hz` }));
             return;
           }
-          {
+          if (appState.rbwHz !== rbw) {
             appState.rbwHz = rbw;
-            appState.rbwComp = Math.max(2, Math.round(rbw / 25000));
+            appState.rbwComp = Math.round(rbw / 25000); // retained for older status clients
+            appState.grid = gridForRange(appState.startFreqMhz, appState.endFreqMhz, rbw);
             appState.sweepConfigSeq = (appState.sweepConfigSeq || 0) + 1;
-            console.log(`[RBW CONFIG] Set RBW to ${appState.rbwHz} Hz (comp ${appState.rbwComp}, seq=${appState.sweepConfigSeq})`);
+            console.log(`[RBW CONFIG] Set output-bin width to ${appState.rbwHz} Hz (seq=${appState.sweepConfigSeq})`);
 
+            // The old trace uses a different frequency grid. Clear it even while scanning is
+            // stopped, then wait for the next completed sweep at this bin width.
+            clearSourceTraces();
             if (appState.scanState === 'SCANNING') {
-              antennaTraces = { A: [], B: [], C: [], D: [], E: [], F: [] };
-              appState.traces = antennaTraces;
-              lastProcessedSweepId = -1;
-              appState.scansCaptured = 0;
-              appState.status = `RE-ARMING SPECTRUM SCAN (${Math.round(rbw / 1000)} kHz RBW)...`;
+              appState.status = `UPDATING RTL-SDR BIN WIDTH (${Math.round(rbw / 1000)} kHz)...`;
+            } else {
+              appState.status = `BIN WIDTH SET TO ${Math.round(rbw / 1000)} kHz - START SCAN FOR A NEW TRACE`;
             }
 
-            // Send config update to bridge
-            const postData = JSON.stringify({ rbwHz: appState.rbwHz });
-            const bridgeReq = http.request({
-              hostname: '127.0.0.1',
-              port: BRIDGE_PORT,
-              path: '/configuration',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            }, (bridgeRes) => {
-              let resData = '';
-              bridgeRes.on('data', c => resData += c);
-              bridgeRes.on('end', () => {
-                console.log(`[BRIDGE CONFIG RESPONSE] RBW updated: ${resData}`);
-              });
-            });
-            bridgeReq.on('error', err => {
-              console.log(`[BRIDGE CONFIG OFFLINE] Will apply on next scan launch: ${err.message}`);
-            });
-            bridgeReq.write(postData);
-            bridgeReq.end();
+            // Keep each receiver on its own frequency span while applying the shared bin width.
+            for (const client of enabledRtlClients()) {
+              const runtime = rtlClientRuntimes.get(client.id);
+              if (!runtime) continue;
+              const [clientStart, clientStop] = clientRange(client);
+              runtime.grid = gridForRange(clientStart, clientStop, appState.rbwHz);
+              if (appState.scanState === 'SCANNING') restartRtlSweep(runtime, { rbwHz: appState.rbwHz });
+              else requestBridge(runtime, '/configuration', { rbwHz: appState.rbwHz });
+            }
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, sweepConfigSeq: appState.sweepConfigSeq, rbwHz: appState.rbwHz, rbwComp: appState.rbwComp }));
@@ -3563,10 +4013,7 @@ function startWebServer() {
             console.log(`[ANTENNA MULTI-SELECT UPDATE] Active Inputs: ${appState.selectedAntennas.join(', ')} (Curve Mask: 0x${appState.curveMask.toString(16).toUpperCase()}, seq=${appState.sweepConfigSeq})`);
 
             if (appState.scanState === 'SCANNING') {
-              antennaTraces = { A: [], B: [], C: [], D: [], E: [], F: [] };
-              appState.traces = antennaTraces;
-              lastProcessedSweepId = -1;
-              appState.scansCaptured = 0;
+              clearSourceTraces();
               appState.status = `RE-ARMING SPECTRUM SCAN...`;
             }
 
@@ -3590,20 +4037,7 @@ function startWebServer() {
               }
             }
 
-            const postData = JSON.stringify(configPayload);
-            const bridgeReq = http.request({
-              hostname: '127.0.0.1',
-              port: BRIDGE_PORT,
-              path: '/configuration',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            }, () => {});
-            bridgeReq.on('error', () => {});
-            bridgeReq.write(postData);
-            bridgeReq.end();
+            broadcastBridgeRequest('/configuration', configPayload);
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, sweepConfigSeq: appState.sweepConfigSeq, selectedAntennas: appState.selectedAntennas, curveMask: appState.curveMask }));
@@ -3677,20 +4111,7 @@ function startWebServer() {
             appState.antennaBiasPending[ant] = { enabled, t: Date.now() };
             console.log(`[ANTENNA BIAS] Requesting port ${ant} 12V DC bias ${enabled ? 'ON' : 'OFF'}`);
 
-            const postData = JSON.stringify({ antenna: ant, enabled: enabled });
-            const bridgeReq = http.request({
-              hostname: '127.0.0.1',
-              port: BRIDGE_PORT,
-              path: '/bias',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            }, () => {});
-            bridgeReq.on('error', () => {});
-            bridgeReq.write(postData);
-            bridgeReq.end();
+            broadcastBridgeRequest('/bias', { antenna: ant, enabled });
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, antennaBias: appState.antennaBias, antennaBiasPending: appState.antennaBiasPending }));
@@ -3710,20 +4131,7 @@ function startWebServer() {
             appState.antennaNames[ant] = name;
             console.log(`[ANTENNA NAME] Port ${ant} alias set to: "${name}"`);
 
-            const postData = JSON.stringify({ antenna: ant, name: name });
-            const bridgeReq = http.request({
-              hostname: '127.0.0.1',
-              port: BRIDGE_PORT,
-              path: '/antenna_name',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            }, () => {});
-            bridgeReq.on('error', () => {});
-            bridgeReq.write(postData);
-            bridgeReq.end();
+            broadcastBridgeRequest('/antenna_name', { antenna: ant, name });
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, antennaNames: appState.antennaNames }));
@@ -3741,21 +4149,13 @@ function startWebServer() {
             appState.scanMode = payload.scanMode;
             console.log(`[SCAN MODE] Sweep Mode set to ${appState.scanMode}`);
 
-            const repeatVal = appState.scanMode === 'SINGLE' ? 1 : 255;
-            const postData = JSON.stringify({ repeat: repeatVal });
-            const bridgeReq = http.request({
-              hostname: '127.0.0.1',
-              port: BRIDGE_PORT,
-              path: '/configuration',
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-              }
-            }, () => {});
-            bridgeReq.on('error', () => {});
-            bridgeReq.write(postData);
-            bridgeReq.end();
+            const repeat = appState.scanMode === 'SINGLE' ? 1 : 255;
+            if (appState.scanState === 'SCANNING') {
+              clearSourceTraces();
+              for (const runtime of rtlClientRuntimes.values()) restartRtlSweep(runtime);
+            } else {
+              broadcastBridgeRequest('/configuration', { repeat });
+            }
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: true, scanMode: appState.scanMode }));
@@ -3777,17 +4177,26 @@ function startWebServer() {
 
   server.listen(WEB_PORT, () => {
     console.log('===========================================================');
-    console.log('  Shure AD600 Web Spectrum Scanner');
+    console.log('  RTL-SDR Web Spectrum Scanner');
     console.log('===========================================================');
     console.log(`  [+] Web Dashboard : http://localhost:${WEB_PORT}`);
-    console.log(`  [+] LAN control   : ${REMOTE_CONTROL ? 'enabled' : 'VIEW-ONLY for other devices (AD600_REMOTE_CONTROL=0)'}`);
+    console.log(`  [+] rtl_tcp node  : ${RTL_TCP_HOST}:${RTL_TCP_PORT}`);
+    console.log(`  [+] LAN control   : ${REMOTE_CONTROL ? 'enabled' : 'VIEW-ONLY for other devices (RTL_REMOTE_CONTROL=0)'}`);
     console.log(`  [+] Chart library : ${fs.existsSync(CHART_JS_LOCAL) ? 'local (offline-capable)' : 'CDN (needs internet - see README)'}`);
-    console.log(`  [+] Engine logs   : ${path.join(SCRATCH_DIR, 'console_out.log')}`);
+    console.log('  [+] Engine logs   : server console');
     console.log('===========================================================');
   });
 }
 
 // Start All Services
-stop18EngineScan();
+loadRtlClientProfiles();
+stopAllRtlTcpClients();
 initAcnSpectrumIngest();
 startWebServer();
+
+function shutdownScanner() {
+  stopAllRtlTcpClients();
+  process.exit(0);
+}
+process.once('SIGINT', shutdownScanner);
+process.once('SIGTERM', shutdownScanner);

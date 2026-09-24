@@ -1,163 +1,110 @@
-# Shure AD600 Web-Based Spectrum Scanner & Manager
+# RTL-SDR Web Spectrum Scanner
 
-A modern, high-performance web dashboard for real-time RF spectrum analysis, antenna diversity management, and remote hardware telemetry control for the **Shure Axient Digital AD600 Spectrum Manager**.
+A browser dashboard for viewing live RF spectrum from an RTL-SDR receiver exposed over the
+`rtl_tcp` protocol. The Node.js server serves the dashboard; a Python backend tunes across the
+selected frequency span, computes FFT power bins, and sends completed sweeps to the browser.
 
-![Shure AD600 Web Dashboard](Screenshots/AD600.png)
+The dashboard is designed for several viewers on the same LAN. Only the server needs to reach the
+RTL-SDR node.
 
----
+## Features
 
-## Why This Project Exists
+- Continuous sweeps or a single sweep snapshot.
+- Manage up to six `rtl_tcp` receivers total, mapped to the original AD600 antenna slots and colors.
+- Choose an independent frequency preset or custom scan span for each receiver.
+- Frequency ranges from 24 MHz to 1766 MHz for the tested R820T tuner.
+- Selectable 50, 100, 350, or 900 kHz output-bin width.
+- Clear-write, max-hold, min-hold, and average traces.
+- Browser access from desktop, tablet, or phone.
 
-In standard production workflows, connecting to the Shure AD600 with Wireless Workbench (WWB) limits the live spectrum view to a single computer and a single operator.
+Signal levels are shown in **dBFS** (relative to the receiver's ADC full scale). The app does not
+calibrate absolute power in dBm.
 
-This application was built to break through that single-screen bottleneck and unlock **collaborative RF workflows** across production teams:
-* **Simultaneous Multi-User Access**: Any number of engineers, technicians, and coordinators can open the live spectrum plot at the same time on their own screens over the local network.
-* **Multi-Device Support**: Responsive web layout optimized for **iPads, tablets, smartphones, and laptops**, allowing team members to carry live spectrum monitoring directly to the stage, backstage, or venue perimeter during walk-tests and rehearsals.
-* **Zero Client Installation**: Team members simply open a web browser on their device to monitor real-time sweeps and antenna status without needing to install desktop software.
+## Start the App
 
----
+Requirements: Node.js 16+ and Python 3.8+. The backend uses only the Python standard library.
 
-## Overview
-
-The Shure AD600 is an industry-standard wideband RF scanner covering **174 MHz to 2.0 GHz**. This application communicates directly with the AD600 over your local network, managing real-time device control, automated frequency configuration, and continuous streaming spectrum telemetry.
-
-It serves an interactive, low-latency dashboard accessible from any web browser on your computer or mobile device.
-
----
-
-## Key Features
-
-### Real-Time RF Spectrum Analysis
-* **High-Speed Hardware Sweeping**: Continuously samples and plots live RF energy (dBm) with fast frame rates.
-* **Selectable Resolution Bandwidth (RBW)**:
-  * `50 kHz` (Very High Resolution)
-  * `100 kHz` (High Resolution)
-  * `350 kHz` (Standard Fast Sweep)
-  * `900 kHz` (High-Speed Overview)
-* **Phosphor Persistence & Max-Hold**: Live instantaneous sweeps with optional dotted peak-memory max-hold traces per antenna.
-* **Single-Shot & Continuous Modes**: Capture single sweep snapshots or stream uninterrupted real-time sweeps.
-
-### Per-Antenna Hardware Ranges & Diversity Pairs
-* **Discrete Antenna Assignments**: Assign independent frequency ranges to individual physical RF inputs (Antennas A through F).
-* **Pre-configured Frequency Presets**:
-  * **Shure Bands**: G57 (470–608 MHz), G57+ (470–616 MHz), G10 (470–542 MHz), H22 (518–584 MHz), J8 (626–664 MHz), J8A (554–616 MHz), K54 (608–663 MHz), X55 (940–960 MHz).
-  * **Sennheiser Bands**: A1–A4 (470–558 MHz), A5–A8 (550–608 MHz).
-  * **Frequency Spans**: VHF (174–216 MHz), Low UHF (470–524 MHz), Mid UHF (524–620 MHz), Upper (608–1000 MHz), AFTRCC (1435–1525 MHz), 470–1000 MHz, 470–2000 MHz, 174–1000 MHz, and Full Span (174–2000 MHz).
-  * **Custom MHz Ranges**: Arbitrary user-defined start and stop frequencies.
-* **Diversity Pair Coupling**: Group paired antennas (`A+B`, `C+D`, `E+F`) into unified interface cards locked to matching frequency windows.
-* **Intelligent Sweep Optimization**: The engine automatically computes the tightest bounding frequency envelope across all active inputs and configures the hardware oscillator to sweep only that window. Sweeping a 150 MHz span (e.g. 470–620 MHz) is **~3.5x faster** than scanning all of UHF.
-
-### 12V DC Antenna Bias Power
-* **Live Status**: Reads the 12V DC bias state of all antenna inputs (A–F) on connection and subscribes to changes, so bias switched elsewhere (front panel, WWB) shows up too.
-* **Hardware-Confirmed Toggle**: Turn antenna DC bias on or off from the browser. The button pulses until the AD600 reports the new state back; if the device doesn't confirm within a few seconds, the status bar says so.
-
-### Interactive DTV Station Masks
-* **US & UK Standards**: Toggle between **US ATSC (6 MHz channels)** and **UK DVB-T/T2 (8 MHz channels)** channel grids.
-* **Station Exclusion Masks**: Click any TV channel marker along the frequency axis to toggle a semi-opaque exclusion overlay across the spectrum display, helping you avoid broadcast TV transmitters.
-
-### Zero-Scroll Compact Layout
-* Squeezed, ergonomic control plane designed to display all controls, antenna inputs, status badges, and the full RF spectrum chart within a single laptop or desktop viewport without scrolling.
-
----
-
-## iPad & Mobile Browser Support
-
-You can operate this application entirely from an **iPad**, tablet, or smartphone connected to the same Wi-Fi or LAN as your computer:
-
-1. Launch the application on your computer.
-2. Ensure your iPad is connected to the same Wi-Fi network or local subnet.
-3. Open **Safari** on your iPad and navigate to:
-   ```text
-   http://<computer-name>.local:8080
-   ```
-   *(or use your computer's local IP address, e.g. `http://192.168.1.50:8080`)*
-
-### Add to iPad Home Screen (Fullscreen Kiosk Mode)
-In Safari on your iPad:
-1. Tap the **Share** button (the square with an arrow pointing up).
-2. Tap **Add to Home Screen**.
-3. Launch the app from your home screen icon to enjoy a borderless, full-screen wireless spectrum analyzer.
-
----
-
-## Connecting
-
-Connecting takes **about 20–30 seconds** — the AD600 needs a paced session handshake and a scan-slot claim before the first sweep arrives. The status bar shows each stage (announcing → joining → claiming scan slot → first sweep).
-
-Only one controller can own the AD600's scan slot at a time. Close **Wireless Workbench** (and SoundBase's AD600 plugin, if it's scanning) before connecting; otherwise the status bar reports that the slot is held by another controller.
-
----
-
-## Quick Start & Installation
-
-### Option 1: One-Click First Launch (Recommended)
-
-#### macOS
-1. Double-click **`start_mac.command`**.
-2. If Node.js is not yet installed on your Mac, the script will automatically offer to install it via Homebrew or open the official Node.js installer page.
-3. The dashboard will automatically start and open in your default browser at `http://localhost:8080`.
-
-#### Windows
-1. Double-click **`start_windows.bat`**.
-2. If Node.js is missing, the script will offer to install it using Windows Package Manager (`winget`) or direct you to the official installer.
-3. The application will start and open your browser at `http://localhost:8080`.
-
----
-
-### Option 2: Manual Launch
-
-#### Prerequisites
-* **Node.js**: v16.0 or higher ([Download Node.js](https://nodejs.org/))
-* **Python**: v3.8 or higher ([Download Python](https://www.python.org/))
-
-#### Running the Server
-Clone the repository and start the server:
-```bash
-git clone https://github.com/mbsound/AD600-Web-Based-Spectrum-Scan.git
-cd AD600-Web-Based-Spectrum-Scan
-
+```sh
 node server.js
 ```
-Open **`http://localhost:8080`** in your web browser.
 
----
+Open [http://localhost:8080](http://localhost:8080), enable one or more receivers in the
+`rtl_tcp Receiver Clients` list, then start a sweep. The default receiver uses
+`127.0.0.1:1234` unless you set `RTL_TCP_HOST` and `RTL_TCP_PORT`.
 
-## Network Configuration
+Configure another node with environment variables:
 
-* **Direct Ethernet Connection**: Set your computer's network interface to Link-Local / DHCP (typically `169.254.x.x`) to connect directly to the AD600's primary network port.
-* **Interface Selection**: Leave the interface on *All* and the app picks the network interface whose subnet actually contains the AD600, whatever your adapters are called.
-* **Network Discovery (SLP)**: The app finds AD600s with Shure's SLP adverts on multicast `239.255.254.253`, UDP port `8427`.
-* **Session Traffic**: The AD600's control session lives on UDP port `57383` *on the device*; the device streams scan data back to a random (ephemeral) UDP port on this computer.
-* **Firewall**: Allow incoming TCP `8080` (dashboard for other devices) and incoming UDP for Python (discovery adverts on `8427` and the device's scan stream). On macOS, answer *Allow* when asked about incoming connections for `node` and `python3`.
-
-## Offline Use (No Internet at the Venue)
-
-The dashboard is fully self-contained: the chart library ([Chart.js](https://www.chartjs.org/) v4, MIT) ships in `vendor/chart.umd.min.js` and is served by the app, so it works on a closed show network or a direct link-local cable with no internet. (If that file is ever removed, browsers fall back to the jsDelivr CDN.)
-
-## Control Access
-
-By default every browser on the network can use the controls (connect, ranges, RBW, antenna bias). To make other devices **view-only** — they still see the live spectrum — start the server with:
-
-```bash
-AD600_REMOTE_CONTROL=0 node server.js
+```sh
+RTL_TCP_HOST=rtl-sdr.local RTL_TCP_PORT=1234 node server.js
 ```
 
-Controls then work only from the computer running the server.
+The scanner defaults to a sample rate of `1800000` samples/s, manual tuner gain of `25` dB,
+and both tuner AGC and digital AGC disabled. Override these with `RTL_SAMPLE_RATE`,
+`RTL_TUNER_GAIN_DB`, `RTL_TUNER_AGC=1`, or `RTL_DIGITAL_AGC=1` when needed. Set
+`RTL_REMOTE_CONTROL=0` to make browser controls available only on the server computer.
 
----
+Each receiver must run its own `rtl_tcp` server and allow one connection from the app host. The app
+opens one client connection for each enabled receiver, then sets the sample rate and tuner frequency
+through each server's command stream. Do not add the same host and port more than once. Enabled
+receivers scan together with their own frequency spans and the shared bin width. Their spans and
+receiver profiles are saved in `~/.rtl_tcp_spectrum_scanner/clients.json`; profiles start disabled
+when the app restarts.
 
-## Architecture & Code Structure
+## How Scans Work
 
-* `server.js`: Node.js web server, REST API router (`/api/status`, `/api/connect`, `/api/scan`, `/api/range`, `/api/rbw`, `/api/antenna`, `/api/bias`, `/api/iface`, `/api/target`, `/api/scan_mode`, `/api/antenna_name`), and the single-page dashboard.
-* `engine/ad600_console.py`: Core hardware communications engine managing network sessions, embedded scan initialization, parameter control, and real-time hardware telemetry emission.
-* `engine/ad600_bridge.py`: Local bridge engine interfacing the console process with the web server.
-* `engine/ad600_native.py`: Low-level protocol framing, packet codecs, and data stream parsers.
-* `engine/ad600_discovery.py`: SLP device discovery, network interface enumeration, and subnet-based interface matching.
-* Engine logs and the console command file live in `~/.ad600_node_app/` (`console_out.log`, rotated at 20 MB).
-* `start_mac.command`: macOS first-launch shell script with Node.js prerequisite checks.
-* `start_windows.bat`: Windows first-launch batch script with automatic `winget` installation support.
+The backend captures 4096 complex I/Q samples at each tuner position, applies a Hann window, and
+computes a radix-2 FFT. It combines FFT power into the selected output-bin width and steps through
+the requested range. A sweep covers the complete configured range; wide spans take longer because
+the tuner must retune between segments. The receiver's sample rate and tuner hardware limit the
+capture bandwidth and sensitivity.
 
----
+Continuous mode repeats complete sweeps until stopped; Single mode captures one complete sweep.
+The chart updates when a sweep finishes. Each antenna shows progress, tuner frequency, and elapsed
+time while scanning. The backend drains incoming IQ during FFT processing and waits 100 ms after
+each retune before collecting a fresh frame. `RTL_SETTLE_MS` can override this delay (10–2000 ms).
+rtl_tcp does not acknowledge tuning or timestamp IQ, so the required delay depends on the receiver
+and network. The default 54 MHz span requires 38 tuner positions at 1.8 MS/s, plus processing time.
+
+The frequency range presets are convenience values. Manual scan ranges are limited to 24 MHz
+through 1766 MHz, which match the R820T test node. Adjust those limits before using a different
+tuner model with a different tuning range.
+
+## Network Access
+
+The dashboard listens on TCP port `8080`. Other devices can open `http://<server-ip>:8080` when
+they share a network with the server. The server connects outward to the configured rtl_tcp host
+and port; no incoming RTL-SDR connection to the dashboard computer is required.
+
+By default, browsers on the LAN can operate the scanner. Use `RTL_REMOTE_CONTROL=0` to make them
+view-only while keeping controls enabled on the server computer.
+
+## Project Structure
+
+- `server.js`: Node.js HTTP server, dashboard, and API.
+- `engine/rtl_tcp_backend.py`: rtl_tcp client, FFT scanner, and local trace bridge.
+- `vendor/chart.umd.min.js`: bundled Chart.js for offline dashboard use.
+- `start_mac.command` and `start_windows.bat`: launch helpers.
+
+The earlier AD600 protocol modules remain in `engine/` for reference. The dashboard uses the
+rtl_tcp backend.
+
+## Validation
+
+Syntax checks:
+
+```sh
+node --check server.js
+python3 -m py_compile engine/rtl_tcp_backend.py
+python3 -m unittest discover -s tests -v
+node tests/test_sweep_restart.js
+```
+
+The regression checks use synthetic IQ and a localhost rtl_tcp simulator. They cover continuous
+and single sweeps, restart cancellation, band coverage, upper-limit tuning, IQ buffering, and
+configuration-before-start ordering. They do not establish physical receiver tuning performance.
+
+For hardware validation, connect to the configured rtl_tcp node, start a scan, and confirm that
+the bridge returns a trace with `unit: "dBFS"` and the configured frequency grid.
 
 ## License
 

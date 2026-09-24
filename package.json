@@ -1,7 +1,7 @@
 {
-  "name": "shure-ad600-node-app",
+  "name": "rtl-sdr-web-spectrum-scanner",
   "version": "1.0.0",
-  "description": "Cross-platform Node.js Auto-Discovery & Real-Time Spectrum GUI for Shure AD600 Spectrum Manager",
+  "description": "Cross-platform rtl_tcp spectrum scanner with a browser-based FFT dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

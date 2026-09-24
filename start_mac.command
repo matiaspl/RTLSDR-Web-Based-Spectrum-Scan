@@ -1,13 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# Shure AD600 Web Spectrum Scanner - Mac First-Launch & Run Script
+# RTL-SDR Web Spectrum Scanner - Mac First-Launch & Run Script
 # ==============================================================================
 
 cd "$(dirname "$0")"
 
 echo ""
 echo "=================================================================="
-echo "   Shure AD600 Spectrum Manager Web Dashboard Launcher"
+echo "   RTL-SDR Web Spectrum Scanner Launcher"
 echo "=================================================================="
 echo ""
 
@@ -65,7 +65,7 @@ echo ""
 ) &
 
 # 4. Start Server
-echo "Starting AD600 Web Spectrum Application..."
+echo "Starting RTL-SDR Web Spectrum Application..."
 echo "Access on this Mac: http://localhost:8080"
 echo "Access on iPad/LAN: http://$(hostname):8080 or http://<Your-Mac-IP>:8080"
 echo ""
