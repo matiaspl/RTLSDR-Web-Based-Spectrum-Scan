@@ -2,7 +2,8 @@
 
 A browser dashboard for viewing live RF spectrum from an RTL-SDR receiver exposed over the
 `rtl_tcp` protocol. The Node.js server serves the dashboard; a Python backend tunes across the
-selected frequency span, computes FFT power bins, and sends completed sweeps to the browser.
+selected frequency span, computes native FFT bins, and streams each captured segment to the
+browser as the sweep progresses.
 
 The dashboard is designed for several viewers on the same LAN. Only the server needs to reach the
 RTL-SDR node.
@@ -13,7 +14,7 @@ RTL-SDR node.
 - Manage up to six `rtl_tcp` receivers total, mapped to the original AD600 antenna slots and colors.
 - Choose an independent frequency preset or custom scan span for each receiver.
 - Frequency ranges from 24 MHz to 1766 MHz for the tested R820T tuner.
-- Selectable 50, 100, 350, or 900 kHz output-bin width.
+- Native FFT-bin traces with viewport-sized min/max rendering that retains narrow peaks.
 - Clear-write, max-hold, min-hold, and average traces.
 - Browser access from desktop, tablet, or phone.
 
@@ -46,22 +47,26 @@ and both tuner AGC and digital AGC disabled. Override these with `RTL_SAMPLE_RAT
 Each receiver must run its own `rtl_tcp` server and allow one connection from the app host. The app
 opens one client connection for each enabled receiver, then sets the sample rate and tuner frequency
 through each server's command stream. Do not add the same host and port more than once. Enabled
-receivers scan together with their own frequency spans and the shared bin width. Their spans and
-receiver profiles are saved in `~/.rtl_tcp_spectrum_scanner/clients.json`; profiles start disabled
-when the app restarts.
+receivers scan together with their own frequency spans. Their spans and receiver profiles are
+saved in `~/.rtl_tcp_spectrum_scanner/clients.json`; profiles start disabled when the app restarts.
 
 ## How Scans Work
 
 The backend captures 4096 complex I/Q samples at each tuner position, applies a Hann window, and
-computes a radix-2 FFT. It combines FFT power into the selected output-bin width and steps through
-the requested range. A sweep covers the complete configured range; wide spans take longer because
-the tuner must retune between segments. The receiver's sample rate and tuner hardware limit the
-capture bandwidth and sensitivity.
+computes a radix-2 FFT. It streams the individual FFT bins after each tuner position. Bin spacing
+is `RTL_SAMPLE_RATE / 4096` (about 439 Hz at the default 1.8 MS/s); this is the spacing between
+reported samples, while the window also affects practical frequency resolution. The sample rate
+sets the captured complex-signal bandwidth, and the scanner uses 80% of that span at each tuner
+position to avoid edge bins. The chart groups samples into per-pixel min/max envelopes, preserving
+visible peaks without sending every bin to the browser. A sweep covers the complete configured
+range; wide spans take longer because the tuner must retune between segments. The receiver and
+tuner hardware limit capture bandwidth and sensitivity.
 
 Continuous mode repeats complete sweeps until stopped; Single mode captures one complete sweep.
-The chart updates when a sweep finishes. Each antenna shows progress, tuner frequency, and elapsed
-time while scanning. The backend drains incoming IQ during FFT processing and waits 100 ms after
-each retune before collecting a fresh frame. `RTL_SETTLE_MS` can override this delay (10–2000 ms).
+The chart updates as each tuner segment completes. Each antenna shows progress, tuner frequency,
+and elapsed time while scanning. The backend drains incoming IQ during FFT processing and waits
+30 ms after each retune before collecting a fresh frame. Set `RTL_SETTLE_MS` to override this delay
+(10–2000 ms).
 rtl_tcp does not acknowledge tuning or timestamp IQ, so the required delay depends on the receiver
 and network. The default 54 MHz span requires 38 tuner positions at 1.8 MS/s, plus processing time.
 

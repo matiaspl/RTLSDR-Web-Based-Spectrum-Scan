@@ -14,6 +14,7 @@ import struct
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 
 BRIDGE_PORT = int(os.environ.get("RTL_BRIDGE_PORT", "8088"))
@@ -32,7 +33,7 @@ TUNER_AGC = os.environ.get("RTL_TUNER_AGC", "0") == "1"
 DIGITAL_AGC = os.environ.get("RTL_DIGITAL_AGC", "0") == "1"
 FFT_SIZE = 4096
 SCAN_STEP_FACTOR = 0.8
-SETTLE_SECONDS = float(os.environ.get("RTL_SETTLE_MS", "100")) / 1000.0
+SETTLE_SECONDS = float(os.environ.get("RTL_SETTLE_MS", "30")) / 1000.0
 if not math.isfinite(SETTLE_SECONDS) or not 0.01 <= SETTLE_SECONDS <= 2.0:
     raise ValueError("RTL_SETTLE_MS must be between 10 and 2000")
 MIN_FREQUENCY_HZ = 24_000_000
@@ -105,6 +106,8 @@ class Bridge:
         self.trace = None
         self.sweep_id = 0
         self.sweep_count = 0
+        self.pass_id = 0
+        self.pending_updates = []
         self.revision = 0
         self.max_hold = None
         self.min_hold = None
@@ -222,6 +225,7 @@ class Bridge:
                 self.revision += 1
                 self.trace = None
                 self.progress = None
+                self.pending_updates = []
                 self._reset_accum()
         return self.configuration()
 
@@ -238,6 +242,7 @@ class Bridge:
             self.trace = None
             self.progress = None
             self.sweep_count = 0
+            self.pending_updates = []
             self._reset_accum()
         return {"sweeping": True, "sweepId": self.sweep_id}
 
@@ -252,7 +257,14 @@ class Bridge:
         with self.lock:
             return self.sweeping
 
-    def publish(self, values, config, expected_revision):
+    def begin_pass(self, config):
+        with self.lock:
+            if config["revision"] != self.revision or not self.sweeping:
+                return None
+            self.pass_id += 1
+            return self.pass_id
+
+    def publish(self, values, config, expected_revision, pass_id=None):
         with self.lock:
             if expected_revision != self.revision or not self.sweeping:
                 return False
@@ -290,6 +302,7 @@ class Bridge:
                 "stepHz": config["rbwHz"],
                 "pointCount": len(values),
                 "sweepId": self.sweep_id,
+                "passId": pass_id if pass_id is not None else self.pass_id,
                 "sweepCount": self.sweep_count,
                 "coverageComplete": True,
                 "coveragePct": 100,
@@ -299,8 +312,52 @@ class Bridge:
                 "series": [{
                     "name": "A",
                     "amplitudesDbfs": [round(max(FLOOR_DBFS, min(10.0, v)) * 10) / 10 for v in output],
+                    "coverage": [True] * len(values),
                 }],
                 "sweeping": self.sweeping,
+                "antennaBias": {"A": False},
+                "antennaNames": {"A": "RTL-SDR"},
+            }
+            return True
+
+    def publish_partial(self, values, coverage, config, expected_revision,
+                        frequencies_hz, native_values, pass_id):
+        """Expose the current output grid and native FFT bins during an in-progress sweep."""
+        with self.lock:
+            if expected_revision != self.revision or not self.sweeping:
+                return False
+            captured = sum(1 for covered in coverage if covered)
+            amplitudes = [round(max(FLOOR_DBFS, min(10.0, value)) * 10) / 10 for value in values]
+            self.sweep_id += 1
+            update = {
+                "sweepId": self.sweep_id,
+                "passId": pass_id,
+                "startHz": config["startHz"],
+                "stopHz": config["stopHz"],
+                "binHz": getattr(self.scanner, "bin_hz", 0),
+                "frequenciesHz": frequencies_hz,
+                "amplitudesDbfs": [round(max(FLOOR_DBFS, min(10.0, value)) * 10) / 10 for value in native_values],
+            }
+            self.pending_updates.append(update)
+            self.trace = {
+                "startHz": config["startHz"],
+                "stopHz": config["stopHz"],
+                "stepHz": config["rbwHz"],
+                "pointCount": len(values),
+                "sweepId": self.sweep_id,
+                "passId": pass_id,
+                "sweepCount": self.sweep_count,
+                "coverageComplete": captured == len(coverage),
+                "coveragePct": round(100.0 * captured / max(1, len(coverage)), 1),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+                "unit": "dBFS",
+                "amplitudesDbfs": amplitudes,
+                "series": [{
+                    "name": "A",
+                    "amplitudesDbfs": amplitudes,
+                    "coverage": coverage[:],
+                }],
+                "sweeping": True,
                 "antennaBias": {"A": False},
                 "antennaNames": {"A": "RTL-SDR"},
             }
@@ -329,7 +386,7 @@ class Bridge:
                     "elapsedSeconds": round(time.monotonic() - started, 1),
                 }
 
-    def get_trace(self):
+    def get_trace(self, after_sweep_id=-1):
         with self.lock:
             # Progress is live even before the first completed sweep. Never expose an old
             # trace's captured 'sweeping' flag as the current controller state.
@@ -340,6 +397,8 @@ class Bridge:
             }
             result["sweeping"] = self.sweeping
             result["progress"] = dict(self.progress) if self.progress else None
+            result["updates"] = [update for update in self.pending_updates if update["sweepId"] > after_sweep_id]
+            self.pending_updates = [update for update in self.pending_updates if update["sweepId"] > after_sweep_id]
             return result
 
     def serve(self):
@@ -374,7 +433,12 @@ class Bridge:
                 if route == "/sweep/stop":
                     return self._json(200, bridge.sweep_stop())
                 if route == "/trace":
-                    trace = bridge.get_trace()
+                    query = parse_qs(self.path.partition("?")[2])
+                    try:
+                        after_sweep_id = int(query.get("after", ["-1"])[0])
+                    except ValueError:
+                        after_sweep_id = -1
+                    trace = bridge.get_trace(after_sweep_id)
                     if trace is None:
                         return self._json(409, {"error": "no_trace"})
                     return self._json(200, trace)
@@ -425,6 +489,7 @@ class Scanner:
         self.iq_bytes = 0
         self.reader_error = None
         self.settle_seconds = SETTLE_SECONDS
+        self.last_pass_id = None
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="rtl-tcp-scanner", daemon=True)
@@ -541,7 +606,7 @@ class Scanner:
                     config = self.bridge.config_snapshot()
                     values = self._scan(config)
                     if values is not None:
-                        published = self.bridge.publish(values, config, config["revision"])
+                        published = self.bridge.publish(values, config, config["revision"], self.last_pass_id)
                         if published and (self.bridge.sweep_count == 1 or self.bridge.sweep_count % 25 == 0):
                             print("[RTL TCP] SWEEP %d complete (%d points, %d MHz span, %d kHz bins)" % (
                                 self.bridge.sweep_count,
@@ -571,8 +636,13 @@ class Scanner:
 
     def _scan(self, config):
         start_hz, stop_hz, step_hz = config["startHz"], config["stopHz"], config["rbwHz"]
+        pass_id = self.bridge.begin_pass(config)
+        if pass_id is None:
+            return None
+        self.last_pass_id = pass_id
         count = max(1, (stop_hz - start_hz) // step_hz + 1)
         powers = [0.0] * count
+        coverage = [False] * count
         segments = list(scan_segments(start_hz, stop_hz, self.sample_rate))
         started = time.monotonic()
         for segment_index, (center_hz, left, right) in enumerate(segments):
@@ -592,6 +662,7 @@ class Scanner:
                 qv = (raw[i * 2 + 1] - mean_q) / 127.5
                 bins[i] = complex(iv, qv) * self.window[i]
             _fft(bins)
+            native_points = []
             for fft_index, sample in enumerate(bins):
                 signed_index = fft_index if fft_index < FFT_SIZE // 2 else fft_index - FFT_SIZE
                 frequency = center_hz + signed_index * self.bin_hz
@@ -599,12 +670,22 @@ class Scanner:
                 # double-count the overlapping part of the previous tuning window.
                 if frequency < left or frequency > right or (frequency == right and right != stop_hz):
                     continue
+                power = (sample.real * sample.real + sample.imag * sample.imag) / (FFT_SIZE * self.window_energy)
+                native_points.append((frequency, power))
                 point = int(round((frequency - start_hz) / step_hz))
                 if 0 <= point < count:
                     # Parseval normalization makes the sum of FFT-bin power match the captured
                     # complex-sample power. Summing bins gives selected-bin power in dBFS.
-                    powers[point] += (sample.real * sample.real + sample.imag * sample.imag) / (FFT_SIZE * self.window_energy)
+                    powers[point] += power
+                    coverage[point] = True
             self.bridge.set_progress(config, segment_index + 1, len(segments), center_hz, started)
+            partial_values = [10.0 * math.log10(power) if power > 1e-12 else FLOOR_DBFS for power in powers]
+            native_points.sort(key=lambda point: point[0])
+            native_frequencies = [point[0] for point in native_points]
+            native_values = [10.0 * math.log10(point[1]) if point[1] > 1e-12 else FLOOR_DBFS
+                             for point in native_points]
+            self.bridge.publish_partial(partial_values, coverage, config, config["revision"],
+                                        native_frequencies, native_values, pass_id)
 
         return [10.0 * math.log10(power) if power > 1e-12 else FLOOR_DBFS for power in powers]
 

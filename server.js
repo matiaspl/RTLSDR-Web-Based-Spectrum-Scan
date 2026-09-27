@@ -157,6 +157,10 @@ const ANT_COLORS = {
 };
 
 const RTL_CLIENT_LIMIT = 6;
+const NATIVE_TRACE_BLOCK_SIZE = 64;
+const configuredRtlSampleRate = Number.parseInt(process.env.RTL_SAMPLE_RATE || '1800000', 10);
+const RTL_SAMPLE_RATE_HZ = Number.isFinite(configuredRtlSampleRate) ? configuredRtlSampleRate : 1800000;
+const RTL_FFT_SIZE = 4096;
 const RTL_SLOT_RANGES = {
   A: [470.0, 524.0],
   B: [524.0, 620.0],
@@ -168,6 +172,149 @@ const RTL_SLOT_RANGES = {
 const RTL_SLOTS = Object.keys(ANT_COLORS);
 
 let sourceTraces = { 'rtl-client-1': [] };
+let nativeSourceTraces = { 'rtl-client-1': emptyNativeTrace() };
+
+function emptyNativeTrace() {
+  return {
+    passId: null,
+    lastUpdateId: -1,
+    startHz: 0,
+    stopHz: 0,
+    binHz: 0,
+    values: null,
+    blockMin: null,
+    blockMax: null,
+    blockMinIndex: null,
+    blockMaxIndex: null
+  };
+}
+
+function nativeTraceForUpdate(update) {
+  const startHz = Number(update.startHz);
+  const stopHz = Number(update.stopHz);
+  const fftBinHz = Number(update.binHz);
+  if (!Number.isFinite(startHz) || !Number.isFinite(stopHz) || !Number.isFinite(fftBinHz) ||
+      stopHz <= startHz || fftBinHz <= 0) {
+    return emptyNativeTrace();
+  }
+  const maxPointCount = 8_000_000;
+  const requestedPointCount = Math.floor((stopHz - startHz) / fftBinHz) + 1;
+  const binHz = requestedPointCount > maxPointCount
+    ? (stopHz - startHz) / (maxPointCount - 1)
+    : fftBinHz;
+  const pointCount = Math.floor((stopHz - startHz) / binHz) + 1;
+  if (pointCount < 1 || pointCount > maxPointCount) return emptyNativeTrace();
+  const blockCount = Math.ceil(pointCount / NATIVE_TRACE_BLOCK_SIZE);
+  const values = new Float32Array(pointCount);
+  values.fill(NaN);
+  const blockMin = new Float32Array(blockCount);
+  blockMin.fill(Infinity);
+  const blockMax = new Float32Array(blockCount);
+  blockMax.fill(-Infinity);
+  const blockMinIndex = new Int32Array(blockCount);
+  blockMinIndex.fill(-1);
+  const blockMaxIndex = new Int32Array(blockCount);
+  blockMaxIndex.fill(-1);
+  return {
+    passId: update.passId,
+    lastUpdateId: -1,
+    startHz,
+    stopHz,
+    binHz,
+    values,
+    blockMin,
+    blockMax,
+    blockMinIndex,
+    blockMaxIndex
+  };
+}
+
+function addNativeTracePoint(trace, index, value) {
+  const previous = trace.values[index];
+  if (Number.isFinite(previous) && value <= previous) return;
+  trace.values[index] = value;
+  const block = Math.floor(index / NATIVE_TRACE_BLOCK_SIZE);
+  if (Number.isFinite(previous)) {
+    const blockStart = block * NATIVE_TRACE_BLOCK_SIZE;
+    const blockEnd = Math.min(trace.values.length, blockStart + NATIVE_TRACE_BLOCK_SIZE);
+    let minValue = Infinity, maxValue = -Infinity;
+    let minIndex = -1, maxIndex = -1;
+    for (let pointIndex = blockStart; pointIndex < blockEnd; pointIndex++) {
+      const pointValue = trace.values[pointIndex];
+      if (!Number.isFinite(pointValue)) continue;
+      if (pointValue < minValue) { minValue = pointValue; minIndex = pointIndex; }
+      if (pointValue > maxValue) { maxValue = pointValue; maxIndex = pointIndex; }
+    }
+    trace.blockMin[block] = minValue;
+    trace.blockMax[block] = maxValue;
+    trace.blockMinIndex[block] = minIndex;
+    trace.blockMaxIndex[block] = maxIndex;
+  } else {
+    if (value < trace.blockMin[block]) {
+      trace.blockMin[block] = value;
+      trace.blockMinIndex[block] = index;
+    }
+    if (value > trace.blockMax[block]) {
+      trace.blockMax[block] = value;
+      trace.blockMaxIndex[block] = index;
+    }
+  }
+}
+
+function nativeTracesForViewport(minHz, maxHz, pixelCount) {
+  const min = Number(minHz);
+  const max = Number(maxHz);
+  const pixels = Math.max(64, Math.min(4096, Math.floor(Number(pixelCount) || 1024)));
+  const output = {};
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return output;
+
+  for (const [clientId, trace] of Object.entries(nativeSourceTraces)) {
+    const points = [];
+    if (!trace.values || !trace.binHz || !trace.values.length) {
+      output[clientId] = points;
+      continue;
+    }
+    const firstIndex = Math.max(0, Math.ceil((min - trace.startHz) / trace.binHz));
+    const lastIndex = Math.min(trace.values.length - 1, Math.floor((max - trace.startHz) / trace.binHz));
+    if (lastIndex < firstIndex) {
+      output[clientId] = points;
+      continue;
+    }
+    for (let pixel = 0; pixel < pixels; pixel++) {
+      const pixelMinHz = min + (max - min) * pixel / pixels;
+      const pixelMaxHz = min + (max - min) * (pixel + 1) / pixels;
+      const bucketStart = Math.max(firstIndex, Math.ceil((pixelMinHz - trace.startHz) / trace.binHz));
+      const bucketEnd = Math.min(lastIndex, Math.floor((pixelMaxHz - trace.startHz) / trace.binHz));
+      if (bucketEnd < bucketStart) continue;
+      let minValue = Infinity, maxValue = -Infinity;
+      let minIndex = -1, maxIndex = -1;
+      const include = (index, value) => {
+        if (!Number.isFinite(value)) return;
+        if (value < minValue) { minValue = value; minIndex = index; }
+        if (value > maxValue) { maxValue = value; maxIndex = index; }
+      };
+      for (let index = bucketStart; index <= bucketEnd;) {
+        if (index % NATIVE_TRACE_BLOCK_SIZE === 0 &&
+            index + NATIVE_TRACE_BLOCK_SIZE - 1 <= bucketEnd) {
+          const block = Math.floor(index / NATIVE_TRACE_BLOCK_SIZE);
+          if (trace.blockMinIndex[block] >= 0) include(trace.blockMinIndex[block], trace.blockMin[block]);
+          if (trace.blockMaxIndex[block] >= 0) include(trace.blockMaxIndex[block], trace.blockMax[block]);
+          index += NATIVE_TRACE_BLOCK_SIZE;
+        } else {
+          include(index, trace.values[index]);
+          index++;
+        }
+      }
+      if (minIndex < 0) continue;
+      const extrema = minIndex === maxIndex ? [maxIndex] : [minIndex, maxIndex].sort((a, b) => a - b);
+      for (const index of extrema) {
+        points.push({ x: (trace.startHz + index * trace.binHz) / 1e6, y: trace.values[index] });
+      }
+    }
+    output[clientId] = points;
+  }
+  return output;
+}
 
 function gridForRange(startMhz, stopMhz, stepHz) {
   const startHz = Math.round(startMhz * 1e6);
@@ -332,6 +479,7 @@ function loadRtlClientProfiles() {
     }
     appState.rtlClients = [appState.rtlClients[0], ...profiles];
     sourceTraces = Object.fromEntries(appState.rtlClients.map(client => [client.id, []]));
+    nativeSourceTraces = Object.fromEntries(appState.rtlClients.map(client => [client.id, emptyNativeTrace()]));
   } catch (err) {
     if (err.code !== 'ENOENT') console.error('[RTL CLIENTS] Could not load saved client profiles:', err.message);
   }
@@ -388,6 +536,7 @@ function allocateBridgePort() {
 
 function startRtlTcpClient(client) {
   if (!client || !client.enabled || rtlClientRuntimes.has(client.id)) return;
+  nativeSourceTraces[client.id] = emptyNativeTrace();
   const [startMhz, stopMhz] = clientRange(client);
   const clientGrid = gridForRange(startMhz, stopMhz, appState.rbwHz);
   const bridgePort = allocateBridgePort();
@@ -474,6 +623,7 @@ function stopRtlTcpClient(clientId) {
     try { runtime.proc.kill('SIGTERM'); } catch (e) {}
   }
   sourceTraces[clientId] = [];
+  nativeSourceTraces[clientId] = emptyNativeTrace();
   const client = appState.rtlClients.find(item => item.id === clientId);
   if (client) client.state = 'DISCONNECTED';
   syncRtlConnectionState();
@@ -523,6 +673,7 @@ function restartRtlSweep(runtime, configuration = {}) {
   runtime.lastSweepComplete = false;
   runtime.progress = null;
   sourceTraces[runtime.clientId] = [];
+  nativeSourceTraces[runtime.clientId] = emptyNativeTrace();
   const failed = () => {
     runtime.pendingSweepStart = false;
     const client = appState.rtlClients.find(item => item.id === runtime.clientId);
@@ -572,7 +723,8 @@ function startBridgePolling(runtime) {
     if (rtlClientRuntimes.get(runtime.clientId) !== runtime || runtime.pollInFlight) return;
     runtime.pollInFlight = true;
     const pollEpoch = runtime.commandEpoch;
-    const req = http.get(`http://127.0.0.1:${runtime.bridgePort}/trace`, res => {
+    const afterSweepId = Number.isInteger(runtime.lastProcessedSweepId) ? runtime.lastProcessedSweepId : -1;
+    const req = http.get(`http://127.0.0.1:${runtime.bridgePort}/trace?after=${afterSweepId}`, res => {
       let body = '';
       res.on('data', chunk => body += chunk);
       res.on('end', () => {
@@ -593,23 +745,47 @@ function startBridgePolling(runtime) {
               pointCount: json.pointCount || (json.series && json.series[0] ? json.series[0].amplitudesDbfs.length : 0)
             };
           }
-          if (!Array.isArray(json.series) || !json.series[0]?.amplitudesDbfs?.length ||
-              appState.scanState !== 'SCANNING' || !gridMatchesConfig) return;
-          if (json.sweepId === undefined || json.sweepId === runtime.lastProcessedSweepId) return;
-          runtime.lastProcessedSweepId = json.sweepId;
-          runtime.lastSweepComplete = json.sweeping === false;
+          if (appState.scanState !== 'SCANNING' || !gridMatchesConfig) return;
           const series = json.series[0];
-          const rawAmps = (series && series.amplitudesDbfs) || [];
-          const previous = sourceTraces[runtime.clientId] || [];
-          if (rawAmps.length) {
-            sourceTraces[runtime.clientId] = rawAmps.map((value, index) => {
-              if (value > TRACE_FLOOR_DBFS && value <= TRACE_CEILING_DBFS) return value;
-              return previous[index] !== undefined ? previous[index] : TRACE_FLOOR_DBFS - 5;
-            });
+          const updates = Array.isArray(json.updates) ? json.updates : [];
+          let nativeTrace = nativeSourceTraces[runtime.clientId] || emptyNativeTrace();
+          for (const update of updates) {
+            if (!Array.isArray(update.frequenciesHz) || !Array.isArray(update.amplitudesDbfs)) continue;
+            if (update.passId !== nativeTrace.passId) {
+              nativeTrace = nativeTraceForUpdate(update);
+              if (!nativeTrace.values) continue;
+              runtime.lastSweepComplete = false;
+            }
+            if (update.sweepId <= nativeTrace.lastUpdateId) continue;
+            const pointCount = Math.min(update.frequenciesHz.length, update.amplitudesDbfs.length);
+            for (let i = 0; i < pointCount; i++) {
+              const frequencyHz = Number(update.frequenciesHz[i]);
+              const value = Number(update.amplitudesDbfs[i]);
+              if (!Number.isFinite(frequencyHz) || !Number.isFinite(value) ||
+                  value < TRACE_FLOOR_DBFS || value > TRACE_CEILING_DBFS) continue;
+              const index = Math.round((frequencyHz - nativeTrace.startHz) / nativeTrace.binHz);
+              if (index >= 0 && index < nativeTrace.values.length) addNativeTracePoint(nativeTrace, index, value);
+            }
+            nativeTrace.lastUpdateId = update.sweepId;
           }
-          appState.scansCaptured = Math.max(appState.scansCaptured, json.sweepCount || 0);
-          appState.lastScanTime = Date.now();
-          syncRtlConnectionState();
+          nativeSourceTraces[runtime.clientId] = nativeTrace;
+          if (json.sweepId !== undefined && json.sweepId !== runtime.lastProcessedSweepId) {
+            runtime.lastProcessedSweepId = json.sweepId;
+            runtime.lastSweepComplete = json.sweeping === false;
+            const rawAmps = (series && series.amplitudesDbfs) || [];
+            const coverage = series && series.coverage;
+            const previous = sourceTraces[runtime.clientId] || [];
+            if (rawAmps.length) {
+              sourceTraces[runtime.clientId] = rawAmps.map((value, index) => {
+                if (Array.isArray(coverage) && coverage[index] === false) return null;
+                if (value > TRACE_FLOOR_DBFS && value <= TRACE_CEILING_DBFS) return value;
+                return previous[index] !== undefined ? previous[index] : TRACE_FLOOR_DBFS - 5;
+              });
+            }
+            appState.scansCaptured = Math.max(appState.scansCaptured, json.sweepCount || 0);
+            appState.lastScanTime = Date.now();
+            syncRtlConnectionState();
+          }
 
           if (appState.scanMode === 'SINGLE' && enabledRtlClients().length > 0 &&
               enabledRtlClients().every(client => {
@@ -643,7 +819,11 @@ function stopAllRtlTcpClients() {
 
 function clearSourceTraces() {
   sourceTraces = {};
-  for (const client of enabledRtlClients()) sourceTraces[client.id] = [];
+  nativeSourceTraces = {};
+  for (const client of enabledRtlClients()) {
+    sourceTraces[client.id] = [];
+    nativeSourceTraces[client.id] = emptyNativeTrace();
+  }
   appState.scansCaptured = 0;
   appState.lastScanTime = null;
   for (const runtime of rtlClientRuntimes.values()) {
@@ -1568,15 +1748,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="control-group">
-        <label class="control-label">Spectrum Bin Width</label>
-        <select id="rbwSelect" onchange="onRbwSelect(this.value)">
-          <option value="50000">50 kHz</option>
-          <option value="100000">100 kHz</option>
-          <option value="350000" selected>350 kHz</option>
-          <option value="900000">900 kHz</option>
-        </select>
-      </div>
     </div>
 
     <!-- Scan controls -->
@@ -1872,8 +2043,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       <div class="stat-value" id="scansCaptured">0</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Resolution & Grid</div>
-      <div class="stat-value" id="resVal">350 kHz (1,515 Pts)</div>
+      <div class="stat-label">Native FFT Spacing</div>
+      <div class="stat-value" id="resVal">0.44 kHz</div>
     </div>
   </div>
 
@@ -2825,23 +2996,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       container.textContent = visibleLabels.join('  ·  ');
     }
 
-    async function onRbwSelect(val) {
-      const rbw = parseInt(val, 10);
-      // Immediately clear spectrum trace and max hold from viewing area
-      clearSpectrumDisplay();
-      try {
-        const res = await fetch('/api/rbw', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rbwHz: rbw })
-        });
-        const json = await res.json();
-        if (json) noteOwnConfigSeq(json.sweepConfigSeq);
-      } catch (e) {
-        console.error('Spectrum bin-width update failed:', e);
-      }
-    }
-
     const dtvOverlayPlugin = {
       id: 'dtvOverlayPlugin',
       beforeDatasetsDraw(chartInstance) {
@@ -3035,7 +3189,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
               filter: (item) => !hoveredDtvChannel,
               backgroundColor: 'rgba(18, 24, 38, 0.95)',
               callbacks: {
-                title: (items) => 'Frequency: ' + Number(items[0].parsed.x).toFixed(3) + ' MHz',
+                title: (items) => 'Frequency: ' + Number(items[0].parsed.x).toFixed(6) + ' MHz',
                 label: (item) => item.dataset.label + ': ' + item.parsed.y + ' dBFS'
               }
             }
@@ -3109,7 +3263,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       const newAction = isScanning ? 'stop' : 'start';
       if (newAction === 'start') {
         clearSpectrumDisplay();
-        currentRtlClients.filter(client => client.enabled).forEach(client => { maxHoldBuffers[client.id] = []; });
+        currentRtlClients.filter(client => client.enabled).forEach(client => { maxHoldBuffers[client.slot || 'A'] = []; });
       }
       const scansEl = document.getElementById('scansCaptured');
       if (scansEl) scansEl.innerText = '0';
@@ -3295,7 +3449,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         if (message) message.textContent = 'Enter a valid range from 24 to 1766 MHz';
         return;
       }
-      maxHoldBuffers[id] = [];
+      const client = currentRtlClients.find(item => item.id === id);
+      maxHoldBuffers[client && client.slot || 'A'] = [];
       await postRtlClientAction({ action: 'setRange', id, startMhz: start, stopMhz: stop });
       syncHardwareAndZoom(true, false);
     }
@@ -3321,7 +3476,16 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
     async function fetchStatus() {
       try {
-        const res = await fetch('/api/status');
+        const [viewStartMhz, viewEndMhz] = chart ? getVisibleFreqRange(chart) : computeActiveEnvelope();
+        const plotPixels = chart && chart.chartArea
+          ? chart.chartArea.right - chart.chartArea.left
+          : (document.getElementById('spectrumChart')?.clientWidth || 1024);
+        const statusQuery = new URLSearchParams({
+          minHz: String(Math.round(viewStartMhz * 1e6)),
+          maxHz: String(Math.round(viewEndMhz * 1e6)),
+          pixels: String(Math.ceil(plotPixels))
+        });
+        const res = await fetch('/api/status?' + statusQuery.toString());
         if (!res.ok) return;
         const data = await res.json();
 
@@ -3337,7 +3501,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const enabledClientSignature = (data.rtlClients || []).filter(client => client.enabled).map(client => client.id).join('|');
         if (enabledClientSignature !== displayedRtlClientSignature) {
           displayedRtlClientSignature = enabledClientSignature;
-          currentRtlClients.forEach(client => { maxHoldBuffers[client.id] = []; });
+          currentRtlClients.forEach(client => { maxHoldBuffers[client.slot || 'A'] = []; });
           syncHardwareAndZoom(true, false);
         }
         if (!localSyncPending && (data.sweepConfigSeq || 0) > knownConfigSeq) {
@@ -3349,14 +3513,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         document.getElementById('antennaVal').innerText = String((data.rtlClients || []).filter(client => client.enabled).length);
         document.getElementById('scansCaptured').innerText = data.scansCaptured;
 
-        const grid = data.grid || { startHz: 470000000, stopHz: 524000000, stepHz: 350000, pointCount: 155 };
-        const rbwKhz = Math.round((grid.stepHz || 350000) / 1000);
-        document.getElementById('resVal').innerText = rbwKhz + ' kHz bins (' + (grid.pointCount || 155) + ' Pts)';
-
-        const rbwSelect = document.getElementById('rbwSelect');
-        if (rbwSelect && data.rbwHz && rbwSelect.value != data.rbwHz) {
-          rbwSelect.value = String(data.rbwHz);
-        }
+        const fftBinHz = Number(data.fftBinHz) || 1800000 / 4096;
+        document.getElementById('resVal').innerText = (fftBinHz / 1000).toFixed(2) + ' kHz';
 
         // Sync NICs dropdown
         if (data.interfaces && data.interfaces.length > 0) {
@@ -3475,12 +3633,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const activeKeys = activeClients.map(client => client.id);
         const rtlClientById = new Map(activeClients.map(client => [client.id, client]));
 
-        if (data.traces) {
-          // Plot every rtl_tcp receiver on a numeric MHz axis so different ranges and bin grids
-          // retain their actual frequency positions.
+        const displayTraces = data.nativeTraces || data.traces;
+        if (displayTraces) {
+          // Native FFT points are min/max decimated to the current chart viewport by the server.
           const isReArming = (data.status && data.status.includes('RE-ARMING'));
           const isPendingSeq = targetConfigSeq > 0 && (data.sweepConfigSeq === undefined || data.sweepConfigSeq < targetConfigSeq);
-          const hasAnyData = !isReArming && !isPendingSeq && activeKeys.some(ant => data.traces[ant] && data.traces[ant].length > 0);
+          const hasAnyData = !isReArming && !isPendingSeq && activeKeys.some(ant => displayTraces[ant] && displayTraces[ant].length > 0);
 
           if (hasAnyData) {
             needsTraceWipe = false;
@@ -3491,51 +3649,30 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             const newDatasets = [];
             activeKeys.forEach(clientId => {
               const client = rtlClientById.get(clientId) || {};
-              const raw = data.traces[clientId] || [];
+              const raw = displayTraces[clientId] || [];
               const clientGrid = client.grid || grid;
               const startMhz = clientGrid.startHz / 1e6;
               const stopMhz = clientGrid.stopHz / 1e6;
-              const stepMhz = clientGrid.stepHz / 1e6;
               const seriesLabel = client.name || 'RTL-SDR';
-              const existingDs = chart.data.datasets && chart.data.datasets.find(d => d.clientId === clientId && !d.label.includes('Max Hold'));
-              const existingValuesByFrequency = new Map();
-              if (existingDs && Array.isArray(existingDs.data)) {
-                existingDs.data.forEach(point => {
-                  if (point && Number.isFinite(Number(point.x)) && Number.isFinite(Number(point.y))) {
-                    existingValuesByFrequency.set(Number(point.x).toFixed(3), point.y);
-                  }
-                });
-              }
               const endpoint = client.host.includes(':') ? '[' + client.host + ']' : client.host;
               const traceLabel = (client.slot || '') + ' · ' + seriesLabel + ' (' + endpoint + ':' + client.port + ') — ' +
                 startMhz.toFixed(1) + '–' + stopMhz.toFixed(1) + ' MHz';
 
-              const pts = [];
-              const maxPts = [];
-              if (maxHoldActive[clientId] && (!maxHoldBuffers[clientId] || maxHoldBuffers[clientId].length !== raw.length)) {
-                maxHoldBuffers[clientId] = new Array(raw.length).fill(null);
-              }
-              for (let i = 0; i < raw.length; i++) {
-                const frequencyMhz = startMhz + i * stepMhz;
-                const frequency = frequencyMhz.toFixed(3);
-                const val = raw[i];
-                const previousValue = existingValuesByFrequency.get(frequency);
-                let traceValue;
-                // Keep the previous point for an empty or below-floor dBFS bin.
-                if (val !== undefined && val !== null && val > -125.0) {
-                  traceValue = val;
-                } else if (previousValue !== undefined && previousValue !== null && previousValue > -125.0) {
-                  traceValue = previousValue;
-                } else {
-                  traceValue = val !== undefined ? val : -115.0;
-                }
-                pts.push({ x: frequencyMhz, y: traceValue });
-                if (maxHoldActive[clientId]) {
-                  const prev = maxHoldBuffers[clientId][i];
-                  const peak = (prev === null || prev === undefined) ? traceValue : Math.max(prev, traceValue);
-                  maxHoldBuffers[clientId][i] = peak;
-                  maxPts.push({ x: frequencyMhz, y: peak });
-                }
+              const pts = raw.filter(point => point && Number.isFinite(point.x) && Number.isFinite(point.y));
+              const holdKey = client.slot || 'A';
+              let maxPts = [];
+              if (maxHoldActive[holdKey]) {
+                if (!(maxHoldBuffers[holdKey] instanceof Map)) maxHoldBuffers[holdKey] = new Map();
+                const hold = maxHoldBuffers[holdKey];
+                pts.forEach(point => {
+                  const frequencyHz = Math.round(point.x * 1e6);
+                  const previousPeak = hold.get(frequencyHz);
+                  if (previousPeak === undefined || point.y > previousPeak) hold.set(frequencyHz, point.y);
+                });
+                const [minFreqMhz, maxFreqMhz] = getVisibleFreqRange(chart);
+                maxPts = Array.from(hold, ([frequencyHz, value]) => ({ x: frequencyHz / 1e6, y: value }))
+                  .filter(point => point.x >= minFreqMhz && point.x <= maxFreqMhz)
+                  .sort((a, b) => a.x - b.x);
               }
 
               // 1. Live Instantaneous Trace
@@ -3552,7 +3689,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
               });
 
               // 2. Max Hold Peak Trace (if enabled for this receiver)
-              if (maxHoldActive[clientId]) {
+              if (maxHoldActive[holdKey]) {
                 newDatasets.push({
                   clientId,
                   label: traceLabel + ' Max Hold',
@@ -3672,9 +3809,22 @@ function startWebServer() {
       res.end(JSON.stringify({ success: false, error: 'View-only: controls are limited to the host computer' }));
       return;
     }
-    if (req.url === '/api/status' && req.method === 'GET') {
+    if (urlPath === '/api/status' && req.method === 'GET') {
+      const requestUrl = new URL(req.url, 'http://localhost');
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      const payload = Object.assign({}, appState, { traces: sourceTraces, rtlClients: rtlClientsForStatus(), controlAllowed });
+      const payload = Object.assign({}, appState, {
+        traces: sourceTraces,
+        sampleRateHz: RTL_SAMPLE_RATE_HZ,
+        fftSize: RTL_FFT_SIZE,
+        fftBinHz: RTL_SAMPLE_RATE_HZ / RTL_FFT_SIZE,
+        nativeTraces: nativeTracesForViewport(
+          requestUrl.searchParams.get('minHz'),
+          requestUrl.searchParams.get('maxHz'),
+          requestUrl.searchParams.get('pixels')
+        ),
+        rtlClients: rtlClientsForStatus(),
+        controlAllowed
+      });
       res.end(JSON.stringify(payload));
     } else if (urlPath === '/vendor/chart.umd.min.js' && req.method === 'GET') {
       // Served locally when vendored (works on a show network with no internet), else the CDN.
@@ -3725,9 +3875,11 @@ function startWebServer() {
             };
             appState.rtlClients.push(client);
             sourceTraces[client.id] = [];
+            nativeSourceTraces[client.id] = emptyNativeTrace();
             if (!saveRtlClientProfiles()) {
               appState.rtlClients = appState.rtlClients.filter(item => item.id !== client.id);
               delete sourceTraces[client.id];
+              delete nativeSourceTraces[client.id];
               res.writeHead(500, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: false, error: 'Could not save receiver profile on this host' }));
               return;
@@ -3753,12 +3905,14 @@ function startWebServer() {
                 client.startMhz = startMhz;
                 client.stopMhz = stopMhz;
                 sourceTraces[client.id] = [];
+                nativeSourceTraces[client.id] = emptyNativeTrace();
                 const runtime = rtlClientRuntimes.get(client.id);
                 const nextGrid = gridForRange(startMhz, stopMhz, appState.rbwHz);
                 if (!saveRtlClientProfiles()) {
                   client.startMhz = previousRange[0];
                   client.stopMhz = previousRange[1];
                   sourceTraces[client.id] = [];
+                  nativeSourceTraces[client.id] = emptyNativeTrace();
                   res.writeHead(500, { 'Content-Type': 'application/json' });
                   res.end(JSON.stringify({ success: false, error: 'Could not save receiver frequency range on this host' }));
                   return;
@@ -3778,6 +3932,7 @@ function startWebServer() {
               delete client.error;
               if (client.enabled) {
                 sourceTraces[client.id] = [];
+                nativeSourceTraces[client.id] = emptyNativeTrace();
                 startRtlTcpClient(client);
               } else {
                 stopRtlTcpClient(client.id);
@@ -3796,9 +3951,11 @@ function startWebServer() {
               stopRtlTcpClient(client.id);
               appState.rtlClients = appState.rtlClients.filter(item => item.id !== client.id);
               delete sourceTraces[client.id];
+              delete nativeSourceTraces[client.id];
               if (!saveRtlClientProfiles()) {
                 appState.rtlClients.splice(clientIndex, 0, Object.assign({}, client, { enabled: false, state: 'DISCONNECTED' }));
                 sourceTraces[client.id] = [];
+                nativeSourceTraces[client.id] = emptyNativeTrace();
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'Could not save receiver profile changes on this host' }));
                 return;
