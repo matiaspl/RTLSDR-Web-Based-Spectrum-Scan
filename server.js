@@ -6,34 +6,30 @@ const crypto = require('crypto');
 const WEB_PORT = 8000;
 const SLP_PORT = 8427;
 const SLP_MULTICAST_ADDR = '239.255.254.253';
-const RTL_TCP_HOST = process.env.RTL_TCP_HOST || '127.0.0.1';
-const RTL_TCP_PORT = Number.parseInt(process.env.RTL_TCP_PORT || '1234', 10);
+const DEFAULT_TUNER_AGC = process.env.RTL_TUNER_AGC === '1';
+const DEFAULT_DIGITAL_AGC = process.env.RTL_DIGITAL_AGC === '1';
+const RTL_SETTLE_MIN_MS = 10;
+const RTL_SETTLE_MAX_MS = 2000;
+const configuredRtlSettleMs = Number(process.env.RTL_SETTLE_MS || '30');
+const DEFAULT_RTL_SETTLE_MS = Number.isFinite(configuredRtlSettleMs) &&
+  configuredRtlSettleMs >= RTL_SETTLE_MIN_MS && configuredRtlSettleMs <= RTL_SETTLE_MAX_MS
+  ? Math.round(configuredRtlSettleMs)
+  : 30;
 
 // App State
 let appState = {
   interfaces: [], // list of { name, address }
   selectedInterface: 'ALL', // 'ALL' = auto: pick the NIC whose subnet contains the device
-  discoveredDevices: {
-    [RTL_TCP_HOST]: { ip: RTL_TCP_HOST, model: 'RTL-SDR (rtl_tcp)', iface: 'network', lastSeen: Date.now() }
-  },
-  activeTargetIp: RTL_TCP_HOST,
-  activeTargetModel: 'RTL-SDR (rtl_tcp)',
-  activeTargetSdtPort: RTL_TCP_PORT,
+  discoveredDevices: {},
+  activeTargetIp: null,
+  activeTargetModel: null,
+  activeTargetSdtPort: null,
   connectionState: 'DISCONNECTED', // 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED'
   selectedAntennas: ['A'], // Array of selected antennas, e.g. ['A', 'B']
   inputLabel: 'RTL-SDR',
-  rtlClients: [{
-    id: 'rtl-client-1',
-    name: 'RTL-SDR',
-    host: RTL_TCP_HOST,
-    port: RTL_TCP_PORT,
-    startMhz: 470.0,
-    stopMhz: 524.0,
-    enabled: false,
-    state: 'DISCONNECTED'
-  }],
+  rtlClients: [],
   scanState: 'STOPPED', // 'STOPPED' | 'SCANNING'
-  status: 'DISCONNECTED - RTL-SDR NODE READY',
+  status: 'NO RTL_TCP CLIENTS ENABLED',
   scansCaptured: 0,
   lastScanTime: null,
   startFreqMhz: 470.0,
@@ -66,6 +62,7 @@ let appState = {
     'F': ''
   },
   scanMode: 'CONTINUOUS', // 'CONTINUOUS' | 'SINGLE'
+  settleMs: DEFAULT_RTL_SETTLE_MS,
   curveMask: 0x7E,
   rbwHz: 350000,
   rbwComp: 14,
@@ -171,8 +168,8 @@ const RTL_SLOT_RANGES = {
 };
 const RTL_SLOTS = Object.keys(ANT_COLORS);
 
-let sourceTraces = { 'rtl-client-1': [] };
-let nativeSourceTraces = { 'rtl-client-1': emptyNativeTrace() };
+let sourceTraces = {};
+let nativeSourceTraces = {};
 
 function emptyNativeTrace() {
   return {
@@ -185,7 +182,10 @@ function emptyNativeTrace() {
     blockMin: null,
     blockMax: null,
     blockMinIndex: null,
-    blockMaxIndex: null
+    blockMaxIndex: null,
+    blockPowerSum: null,
+    blockSampleCount: null,
+    blockIndexSum: null
   };
 }
 
@@ -215,6 +215,9 @@ function nativeTraceForUpdate(update) {
   blockMinIndex.fill(-1);
   const blockMaxIndex = new Int32Array(blockCount);
   blockMaxIndex.fill(-1);
+  const blockPowerSum = new Float64Array(blockCount);
+  const blockSampleCount = new Uint8Array(blockCount);
+  const blockIndexSum = new Float64Array(blockCount);
   return {
     passId: update.passId,
     lastUpdateId: -1,
@@ -225,7 +228,10 @@ function nativeTraceForUpdate(update) {
     blockMin,
     blockMax,
     blockMinIndex,
-    blockMaxIndex
+    blockMaxIndex,
+    blockPowerSum,
+    blockSampleCount,
+    blockIndexSum
   };
 }
 
@@ -234,7 +240,9 @@ function addNativeTracePoint(trace, index, value) {
   if (Number.isFinite(previous) && value <= previous) return;
   trace.values[index] = value;
   const block = Math.floor(index / NATIVE_TRACE_BLOCK_SIZE);
+  const power = Math.pow(10, value / 10);
   if (Number.isFinite(previous)) {
+    trace.blockPowerSum[block] += power - Math.pow(10, previous / 10);
     const blockStart = block * NATIVE_TRACE_BLOCK_SIZE;
     const blockEnd = Math.min(trace.values.length, blockStart + NATIVE_TRACE_BLOCK_SIZE);
     let minValue = Infinity, maxValue = -Infinity;
@@ -250,6 +258,9 @@ function addNativeTracePoint(trace, index, value) {
     trace.blockMinIndex[block] = minIndex;
     trace.blockMaxIndex[block] = maxIndex;
   } else {
+    trace.blockPowerSum[block] += power;
+    trace.blockSampleCount[block]++;
+    trace.blockIndexSum[block] += index;
     if (value < trace.blockMin[block]) {
       trace.blockMin[block] = value;
       trace.blockMinIndex[block] = index;
@@ -261,9 +272,10 @@ function addNativeTracePoint(trace, index, value) {
   }
 }
 
-function nativeTracesForViewport(minHz, maxHz, pixelCount) {
+function nativeTracesForViewport(minHz, maxHz, pixelCount, displayMode = 'minmax') {
   const min = Number(minHz);
   const max = Number(maxHz);
+  const averageMode = displayMode === 'average';
   const pixels = Math.max(64, Math.min(4096, Math.floor(Number(pixelCount) || 1024)));
   const output = {};
   if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return output;
@@ -288,8 +300,15 @@ function nativeTracesForViewport(minHz, maxHz, pixelCount) {
       if (bucketEnd < bucketStart) continue;
       let minValue = Infinity, maxValue = -Infinity;
       let minIndex = -1, maxIndex = -1;
+      let powerSum = 0, sampleCount = 0, indexSum = 0;
       const include = (index, value) => {
         if (!Number.isFinite(value)) return;
+        if (averageMode) {
+          powerSum += Math.pow(10, value / 10);
+          sampleCount++;
+          indexSum += index;
+          return;
+        }
         if (value < minValue) { minValue = value; minIndex = index; }
         if (value > maxValue) { maxValue = value; maxIndex = index; }
       };
@@ -297,13 +316,27 @@ function nativeTracesForViewport(minHz, maxHz, pixelCount) {
         if (index % NATIVE_TRACE_BLOCK_SIZE === 0 &&
             index + NATIVE_TRACE_BLOCK_SIZE - 1 <= bucketEnd) {
           const block = Math.floor(index / NATIVE_TRACE_BLOCK_SIZE);
-          if (trace.blockMinIndex[block] >= 0) include(trace.blockMinIndex[block], trace.blockMin[block]);
-          if (trace.blockMaxIndex[block] >= 0) include(trace.blockMaxIndex[block], trace.blockMax[block]);
+          if (averageMode) {
+            powerSum += trace.blockPowerSum[block];
+            sampleCount += trace.blockSampleCount[block];
+            indexSum += trace.blockIndexSum[block];
+          } else {
+            if (trace.blockMinIndex[block] >= 0) include(trace.blockMinIndex[block], trace.blockMin[block]);
+            if (trace.blockMaxIndex[block] >= 0) include(trace.blockMaxIndex[block], trace.blockMax[block]);
+          }
           index += NATIVE_TRACE_BLOCK_SIZE;
         } else {
           include(index, trace.values[index]);
           index++;
         }
+      }
+      if (averageMode) {
+        if (!sampleCount) continue;
+        points.push({
+          x: (trace.startHz + indexSum / sampleCount * trace.binHz) / 1e6,
+          y: 10 * Math.log10(powerSum / sampleCount)
+        });
+        continue;
       }
       if (minIndex < 0) continue;
       const extrema = minIndex === maxIndex ? [maxIndex] : [minIndex, maxIndex].sort((a, b) => a - b);
@@ -345,6 +378,7 @@ function rtlClientsForStatus() {
       slot,
       color: ANT_COLORS[slot],
       progress: rtlClientRuntimes.get(client.id)?.progress || null,
+      calibration: rtlClientRuntimes.get(client.id)?.calibration || { status: 'idle' },
       startMhz,
       stopMhz,
       grid: gridForRange(startMhz, stopMhz, appState.rbwHz)
@@ -354,6 +388,70 @@ function rtlClientsForStatus() {
 
 const rtlClientRuntimes = new Map();
 let nextBridgePort = BRIDGE_PORT;
+
+function calibrationBusy() {
+  return Array.from(rtlClientRuntimes.values()).some(runtime => runtime.calibrationPending ||
+    ['queued', 'measuring'].includes(runtime.calibration?.status));
+}
+
+function calibrationApplyError(client, runtime, revision, ppm) {
+  const result = runtime?.calibration;
+  if (!client.enabled || client.state !== 'CONNECTED' || client.tunerAgc || client.digitalAgc ||
+      result?.status !== 'ready' || !result.canApply ||
+      result.revision !== revision || result.basePpm !== client.ppmCorrection ||
+      result.suggestedPpm !== ppm || !Number.isFinite(result.completedAtMs) ||
+      Date.now() - result.completedAtMs > 300000) {
+    return 'Calibration result is stale or unsuitable; measure again';
+  }
+  return null;
+}
+
+function handleCalibrationRequest(req, res) {
+  let body = '';
+  const respond = (status, data) => {
+    if (res.writableEnded) return;
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+  };
+  req.on('data', chunk => { body += chunk; });
+  req.on('end', () => {
+    let payload;
+    try { payload = JSON.parse(body); } catch (_) { return respond(400, { error: 'Invalid JSON' }); }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return respond(400, { error: 'Expected an object' });
+    const client = appState.rtlClients.find(item => item.id === payload.id);
+    const runtime = client && rtlClientRuntimes.get(client.id);
+    if (!runtime || client.state !== 'CONNECTED') return respond(409, { error: 'Connect this receiver first' });
+    if (!['start', 'cancel'].includes(payload.action)) return respond(400, { error: 'Unknown calibration action' });
+    if (payload.action === 'start' && (appState.scanState !== 'STOPPED' || calibrationBusy())) {
+      return respond(409, { error: 'Stop scanning or cancel the current calibration first' });
+    }
+    const postData = JSON.stringify({ action: payload.action, method: payload.method, referenceHz: payload.referenceHz, durationSeconds: payload.durationSeconds });
+    runtime.calibrationPending = true;
+    const request = http.request({ hostname: '127.0.0.1', port: runtime.bridgePort, path: '/calibration', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) } }, response => {
+      let data = '';
+      response.on('data', chunk => { data += chunk; });
+      response.on('end', () => {
+        runtime.calibrationPending = false;
+        try {
+          const result = JSON.parse(data);
+          if (response.statusCode === 200) runtime.calibration = result;
+          respond(response.statusCode, result);
+        } catch (_) { respond(502, { error: 'Invalid calibration response' }); }
+      });
+      response.on('error', () => {
+        runtime.calibrationPending = false;
+        respond(502, { error: 'Calibration response was interrupted' });
+      });
+    });
+    request.on('error', () => {
+      runtime.calibrationPending = false;
+      respond(502, { error: 'Calibration backend did not respond' });
+    });
+    request.setTimeout(5000, () => request.destroy());
+    request.end(postData);
+  });
+}
 
 let udpDiscoverySocket = null;
 
@@ -447,6 +545,15 @@ function runDiscovery(targetIface = null) {
   });
 }
 
+function normalizePpmCorrection(value) {
+  const ppmCorrection = Number(value);
+  return Number.isInteger(ppmCorrection) && ppmCorrection >= -1000 && ppmCorrection <= 1000 ? ppmCorrection : 0;
+}
+
+function normalizeAgcSetting(value, fallback) {
+  return typeof value === 'boolean' ? value : !!fallback;
+}
+
 function enabledRtlClients() {
   return appState.rtlClients.filter(client => client.enabled);
 }
@@ -455,29 +562,26 @@ function loadRtlClientProfiles() {
   try {
     const saved = JSON.parse(fs.readFileSync(RTL_CLIENT_CONFIG_FILE, 'utf8'));
     if (!Array.isArray(saved)) return;
-    const savedDefault = saved.find(entry => entry && entry.id === 'rtl-client-1');
-    if (savedDefault) {
-      const [startMhz, stopMhz] = clientRange(savedDefault, 0);
-      appState.rtlClients[0].startMhz = startMhz;
-      appState.rtlClients[0].stopMhz = stopMhz;
-    }
     const profiles = [];
     for (const entry of saved) {
       if (!entry || typeof entry !== 'object') continue;
       const name = String(entry.name || '').trim().slice(0, 64);
       const host = String(entry.host || '').trim();
       const port = Number.parseInt(entry.port, 10);
-      if (!entry.id || entry.id === 'rtl-client-1' || !name || !host || /\s/.test(host) ||
+      const id = String(entry.id || '');
+      if (!id || id === 'rtl-client-1' || !name || !host || /\s/.test(host) ||
           host.length > 253 || !Number.isInteger(port) || port < 1 || port > 65535) continue;
-      const defaultClient = appState.rtlClients[0];
-      if ((defaultClient.host.toLowerCase() === host.toLowerCase() && defaultClient.port === port) ||
-          profiles.some(client => client.id === String(entry.id) ||
+      if (profiles.some(client => client.id === id ||
             (client.host.toLowerCase() === host.toLowerCase() && client.port === port))) continue;
-      const [startMhz, stopMhz] = clientRange(entry, profiles.length + 1);
-      profiles.push({ id: String(entry.id), name, host, port, startMhz, stopMhz, enabled: false, state: 'DISCONNECTED' });
-      if (profiles.length >= RTL_CLIENT_LIMIT - 1) break;
+      const [startMhz, stopMhz] = clientRange(entry, profiles.length);
+      profiles.push({ id, name, host, port, startMhz, stopMhz,
+        ppmCorrection: normalizePpmCorrection(entry.ppmCorrection),
+        tunerAgc: normalizeAgcSetting(entry.tunerAgc, DEFAULT_TUNER_AGC),
+        digitalAgc: normalizeAgcSetting(entry.digitalAgc, DEFAULT_DIGITAL_AGC),
+        enabled: false, state: 'DISCONNECTED' });
+      if (profiles.length >= RTL_CLIENT_LIMIT) break;
     }
-    appState.rtlClients = [appState.rtlClients[0], ...profiles];
+    appState.rtlClients = profiles;
     sourceTraces = Object.fromEntries(appState.rtlClients.map(client => [client.id, []]));
     nativeSourceTraces = Object.fromEntries(appState.rtlClients.map(client => [client.id, emptyNativeTrace()]));
   } catch (err) {
@@ -486,9 +590,12 @@ function loadRtlClientProfiles() {
 }
 
 function saveRtlClientProfiles() {
-  const profiles = appState.rtlClients.map(client => client.id === 'rtl-client-1'
-    ? { id: client.id, startMhz: client.startMhz, stopMhz: client.stopMhz }
-    : ({ id: client.id, name: client.name, host: client.host, port: client.port, startMhz: client.startMhz, stopMhz: client.stopMhz }));
+  const profiles = appState.rtlClients.map(client => ({
+    id: client.id, name: client.name, host: client.host, port: client.port,
+    startMhz: client.startMhz, stopMhz: client.stopMhz,
+    ppmCorrection: normalizePpmCorrection(client.ppmCorrection),
+    tunerAgc: !!client.tunerAgc, digitalAgc: !!client.digitalAgc
+  }));
   try {
     fs.mkdirSync(path.dirname(RTL_CLIENT_CONFIG_FILE), { recursive: true });
     fs.writeFileSync(RTL_CLIENT_CONFIG_FILE, JSON.stringify(profiles, null, 2) + '\n', { mode: 0o600 });
@@ -501,7 +608,7 @@ function saveRtlClientProfiles() {
 
 function syncRtlConnectionState() {
   const enabled = enabledRtlClients();
-  const rangeClients = enabled.length ? enabled : appState.rtlClients.slice(0, 1);
+  const rangeClients = enabled.length ? enabled : appState.rtlClients;
   if (rangeClients.length) {
     const ranges = rangeClients.map(client => clientRange(client));
     appState.startFreqMhz = Math.min(...ranges.map(range => range[0]));
@@ -547,9 +654,11 @@ function startRtlTcpClient(client) {
     RTL_TCP_PORT: String(client.port),
     RTL_BRIDGE_PORT: String(bridgePort),
     RTL_SAMPLE_RATE: String(process.env.RTL_SAMPLE_RATE || 1800000),
+    RTL_PPM_CORRECTION: String(normalizePpmCorrection(client.ppmCorrection)),
+    RTL_SETTLE_MS: String(appState.settleMs),
     RTL_TUNER_GAIN_DB: String(process.env.RTL_TUNER_GAIN_DB || 25),
-    RTL_TUNER_AGC: process.env.RTL_TUNER_AGC === '1' ? '1' : '0',
-    RTL_DIGITAL_AGC: process.env.RTL_DIGITAL_AGC === '1' ? '1' : '0',
+    RTL_TUNER_AGC: client.tunerAgc ? '1' : '0',
+    RTL_DIGITAL_AGC: client.digitalAgc ? '1' : '0',
     RTL_START_HZ: String(clientGrid.startHz),
     RTL_STOP_HZ: String(clientGrid.stopHz),
     RTL_RBW_HZ: String(appState.rbwHz || 350000),
@@ -733,6 +842,7 @@ function startBridgePolling(runtime) {
             pollEpoch !== runtime.commandEpoch || runtime.pendingSweepStart) return;
         try {
           const json = JSON.parse(body);
+          if (!runtime.calibrationPending && json.calibration) runtime.calibration = json.calibration;
           runtime.progress = json.sweeping ? json.progress : null;
           const expectedGrid = runtime.grid;
           const gridMatchesConfig = json.startHz === expectedGrid.startHz &&
@@ -842,6 +952,20 @@ function bandOptionsHtml(selectedValue, customLabel) {
   customLabel = customLabel || 'Custom...';
   const sel = v => (v === selectedValue ? ' selected' : '');
   return `
+            <optgroup label="Frequency Spans">
+              <option value="VHF"${sel('VHF')}>VHF: 174 – 216 MHz</option>
+              <option value="470_524"${sel('470_524')}>Low UHF: 470 – 524 MHz</option>
+              <option value="524_620"${sel('524_620')}>Mid UHF: 524 – 620 MHz</option>
+              <option value="608_1000"${sel('608_1000')}>Upper UHF: 608 – 1000 MHz</option>
+              <option value="AFTRCC"${sel('AFTRCC')}>AFTRCC: 1435 – 1525 MHz</option>
+              <option value="470_1000"${sel('470_1000')}>470 – 1000 MHz (1 GHz)</option>
+              <option value="470_1766"${sel('470_1766')}>470 – 1766 MHz (R820T upper span)</option>
+              <option value="174_1000"${sel('174_1000')}>174 – 1000 MHz</option>
+              <option value="FULL_SPAN"${sel('FULL_SPAN')}>Full Span: 24 – 1766 MHz (R820T)</option>
+            </optgroup>
+            <optgroup label="Custom Range">
+              <option value="CUSTOM"${sel('CUSTOM')}>${customLabel}</option>
+            </optgroup>
             <optgroup label="Wireless Mic Bands — Shure">
               <option value="G57"${sel('G57')}>G57: 470 – 608 MHz</option>
               <option value="G57_PLUS"${sel('G57_PLUS')}>G57+: 470 – 616 MHz</option>
@@ -941,20 +1065,7 @@ function bandOptionsHtml(selectedValue, customLabel) {
               <option value="S_EWD_U1_5"${sel('S_EWD_U1_5')}>EW-D U1/5: 823.2–831.8 / 863.2–864.8 MHz</option>
               <option value="S_EWD_V3_4"${sel('S_EWD_V3_4')}>EW-D V3-4: 925.2 – 937.3 MHz</option>
             </optgroup>
-            <optgroup label="Frequency Spans">
-              <option value="VHF"${sel('VHF')}>VHF: 174 – 216 MHz</option>
-              <option value="470_524"${sel('470_524')}>Low UHF: 470 – 524 MHz</option>
-              <option value="524_620"${sel('524_620')}>Mid UHF: 524 – 620 MHz</option>
-              <option value="608_1000"${sel('608_1000')}>Upper UHF: 608 – 1000 MHz</option>
-              <option value="AFTRCC"${sel('AFTRCC')}>AFTRCC: 1435 – 1525 MHz</option>
-              <option value="470_1000"${sel('470_1000')}>470 – 1000 MHz (1 GHz)</option>
-              <option value="470_1766"${sel('470_1766')}>470 – 1766 MHz (R820T upper span)</option>
-              <option value="174_1000"${sel('174_1000')}>174 – 1000 MHz</option>
-              <option value="FULL_SPAN"${sel('FULL_SPAN')}>Full Span: 24 – 1766 MHz (R820T)</option>
-            </optgroup>
-            <optgroup label="Custom Range">
-              <option value="CUSTOM"${sel('CUSTOM')}>${customLabel}</option>
-            </optgroup>`;
+            `;
 }
 
 // 3. Web UI HTML Dashboard Template
@@ -1067,6 +1178,20 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     .rtl-client-custom-range[hidden] { display: none; }
     .rtl-client-custom-range input { min-width: 0; width: 76px; padding: 4px 5px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
     .rtl-client-custom-range button { padding: 4px 7px; font-size: 10px; }
+    .rtl-client-ppm-row { display: flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 10px; }
+    .rtl-client-ppm-row input { min-width: 0; width: 72px; padding: 4px 5px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
+    .rtl-client-ppm-row button { padding: 4px 7px; font-size: 10px; }
+    .fm-calibration { margin-top: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+    .fm-calibration-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin: 10px 0; }
+    .fm-calibration label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+    .fm-calibration input, .fm-calibration select { padding: 6px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; }
+    .fm-calibration p { font-size: 12px; line-height: 1.5; }
+    .fm-calibration a { color: var(--accent); }
+    .fm-calibration button:disabled, .rtl-client-card button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #fmCalibrationResult { white-space: pre-line; }
+    .rtl-client-agc-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; color: var(--text-muted); font-size: 10px; }
+    .rtl-client-agc-toggle { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+    .rtl-client-agc-toggle input { margin: 0; accent-color: var(--accent); }
     .antenna-cards-grid { display: none !important; }
     .rtl-client-add-row { margin-top: 7px; flex-wrap: wrap; }
     .rtl-client-add-row input { min-width: 100px; padding: 5px 7px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; }
@@ -1759,6 +1884,15 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </span>
       </div>
       <div class="diversity-row" style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+        <div class="scan-control-group" style="display: flex; align-items: center; gap: 7px; flex-wrap: wrap;">
+          <span class="control-label">FFT display</span>
+          <div class="scan-mode-toggle" role="group" aria-label="FFT display aggregation">
+            <button id="fftDisplayMinMaxBtn" class="mode-btn active" onclick="setFftDisplayMode('minmax')"
+              title="Show the minimum and maximum FFT-bin power in each screen pixel">Min / Max</button>
+            <button id="fftDisplayAverageBtn" class="mode-btn" onclick="setFftDisplayMode('average')"
+              title="Show average FFT-bin power in each screen pixel; narrow peaks appear lower">Average</button>
+          </div>
+        </div>
         <!-- Continuous / Single Sweep + Start/Stop Spectrum Scan -->
         <div class="scan-control-group" style="display: flex; align-items: center; gap: 8px; margin-left: auto;">
           <div class="scan-mode-toggle">
@@ -1775,12 +1909,40 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </div>
         <div id="rtlClientList" class="rtl-client-list"></div>
         <form id="rtlClientForm" class="rtl-client-add-row" onsubmit="addRtlClient(event)">
-          <input id="rtlClientName" type="text" maxlength="64" placeholder="Antenna name" value="RTL-SDR 2" required>
+          <input id="rtlClientName" type="text" maxlength="64" placeholder="Antenna name" value="RTL-SDR" required>
           <input id="rtlClientHost" type="text" maxlength="253" placeholder="rtl-sdr.local or 192.168.1.20" required>
           <input id="rtlClientPort" type="number" min="1" max="65535" value="1234" aria-label="rtl_tcp port" required>
           <button class="btn-scan" type="submit" style="padding: 5px 11px; font-size: 11px;">ADD ANTENNA</button>
         </form>
         <div id="rtlClientMessage" role="status" aria-live="polite"></div>
+        <section id="fmCalibration" class="fm-calibration" aria-label="PPM calibration" hidden>
+          <strong id="fmCalibrationTitle">PPM calibration</strong>
+          <p>Warm up the receiver for a few minutes. Stop scanning and turn both AGCs off.
+            GSM automatically searches 925–960 MHz and compares FCCH reference bursts across channels (up to 4 minutes, including a check of neighboring PPM settings).
+            FM is a coarse fallback. Correction is only saved when you select Apply.</p>
+          <div class="fm-calibration-controls">
+            <label>Reference method<select id="calibrationMethod" onchange="calibrationNotice=''; fetchStatus();"><option value="gsm">GSM 900 · automatic (kalibrate)</option><option value="fm">FM broadcast · approximate</option></select></label>
+            <label>Known station
+              <select id="fmStation" onchange="selectFmStation()">
+                <option value="92.6">Łódź · Radio ZET · 92.6 MHz</option>
+                <option value="93.5">Łódź · RMF FM · 93.5 MHz</option>
+                <option value="99.2">Łódź · Radio Łódź · 99.2 MHz</option>
+                <option value="custom">Custom station</option>
+              </select>
+            </label>
+            <label>Reference MHz <input id="fmReference" type="number" min="87.5" max="108" step="0.001" value="92.6" oninput="document.getElementById('fmStation').value='custom'; calibrationNotice='';"></label>
+            <label>Measurement
+              <select id="fmDuration"><option value="20">20 seconds</option><option value="40">40 seconds</option><option value="60">60 seconds</option></select>
+            </label>
+            <button id="fmMeasure" class="btn-scan" onclick="runFmCalibration('start')">MEASURE</button>
+            <button id="fmCancel" class="btn-scan" onclick="runFmCalibration('cancel')" disabled>CANCEL</button>
+            <button id="fmApply" class="btn-scan" onclick="applyFmCalibration()" disabled>APPLY CORRECTION</button>
+          </div>
+          <p id="fmCalibrationResult" role="status" aria-live="polite">Choose a receiver and reference station.</p>
+          <p id="fmPresetSources">Łódź preset sources: <a href="https://www.eurozet.pl/Nasze-marki/Stacje-radiowe/Radio-ZET" target="_blank" rel="noopener noreferrer">Radio ZET</a>,
+            <a href="https://www.rmf.fm/index.html?a=odbior" target="_blank" rel="noopener noreferrer">RMF FM</a>,
+            <a href="https://radiolodz.pl/wp-content/uploads/2026/01/Radio-Lodz-Akademia-Wokalna.pdf" target="_blank" rel="noopener noreferrer">Radio Łódź</a>.</p>
+        </section>
       </section>
       <div class="antenna-cards-grid">
         <!-- Joined Antenna Pair A + B Card -->
@@ -2533,6 +2695,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     // Max Hold tracking per antenna
     const maxHoldActive = { A: false, B: false, C: false, D: false, E: false, F: false };
     const maxHoldBuffers = { A: [], B: [], C: [], D: [], E: [], F: [] };
+    let fftDisplayMode = 'minmax';
+    try {
+      if (localStorage.getItem('rtlSpectrumFftDisplayMode') === 'average') fftDisplayMode = 'average';
+    } catch (e) {}
 
     // Returns the diversity partner of an antenna if that pair is currently active
     function getDiversityPartner(ant) {
@@ -2869,6 +3035,23 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       } catch (e) {
         console.error('Scan mode error:', e);
       }
+    }
+
+    function syncFftDisplayModeButtons() {
+      const minMaxButton = document.getElementById('fftDisplayMinMaxBtn');
+      const averageButton = document.getElementById('fftDisplayAverageBtn');
+      if (minMaxButton) minMaxButton.classList.toggle('active', fftDisplayMode === 'minmax');
+      if (averageButton) averageButton.classList.toggle('active', fftDisplayMode === 'average');
+    }
+
+    function setFftDisplayMode(mode) {
+      if (mode !== 'minmax' && mode !== 'average') return;
+      if (fftDisplayMode === mode) return;
+      fftDisplayMode = mode;
+      try { localStorage.setItem('rtlSpectrumFftDisplayMode', mode); } catch (e) {}
+      for (const antenna of ['A', 'B', 'C', 'D', 'E', 'F']) maxHoldBuffers[antenna] = [];
+      syncFftDisplayModeButtons();
+      fetchStatus();
     }
 
     function toggleLockZoom() {
@@ -3292,6 +3475,95 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
     let renderedRtlClientSignature = '';
     let displayedRtlClientSignature = '';
+    let calibrationClientId = null;
+    let calibrationSending = false;
+    let calibrationNotice = '';
+
+    function openFmCalibration(id) {
+      calibrationClientId = id;
+      calibrationNotice = '';
+      document.getElementById('fmCalibration').hidden = false;
+      document.getElementById('fmCalibration').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      fetchStatus();
+    }
+
+    function selectFmStation() {
+      const value = document.getElementById('fmStation').value;
+      if (value !== 'custom') document.getElementById('fmReference').value = value;
+      calibrationNotice = '';
+    }
+
+    function renderFmCalibration(data) {
+      if (!calibrationClientId) return;
+      const client = (data.rtlClients || []).find(item => item.id === calibrationClientId);
+      const result = client && client.calibration || { status: 'idle' };
+      const active = ['queued', 'measuring'].includes(result.status);
+      const anyActive = (data.rtlClients || []).some(item => ['queued', 'measuring'].includes(item.calibration?.status));
+      const connected = client && client.enabled && client.state === 'CONNECTED';
+      const allowed = data.controlAllowed !== false;
+      document.getElementById('fmCalibrationTitle').textContent = 'PPM calibration — ' + (client ? client.name : 'receiver unavailable');
+      document.getElementById('fmMeasure').disabled = calibrationSending || !allowed || !connected || anyActive ||
+        data.scanState !== 'STOPPED' || client.tunerAgc || client.digitalAgc;
+      document.getElementById('fmCancel').disabled = calibrationSending || !allowed || !active;
+      const method = document.getElementById('calibrationMethod').value;
+      document.getElementById('calibrationMethod').disabled = active || calibrationSending;
+      ['fmStation', 'fmReference', 'fmDuration'].forEach(id => { document.getElementById(id).parentElement.style.display = method === 'gsm' ? 'none' : 'flex'; });
+      document.getElementById('fmPresetSources').hidden = method === 'gsm';
+      const referenceHz = Math.round(Number(document.getElementById('fmReference').value) * 1e6);
+      const applicable = result.status === 'ready' && result.canApply && result.basePpm === client?.ppmCorrection &&
+        (result.method || 'fm') === method && (method === 'gsm' || result.referenceHz === referenceHz) && Date.now() - result.completedAtMs <= 300000;
+      document.getElementById('fmApply').disabled = calibrationSending || !allowed || !connected || anyActive || !applicable;
+      ['fmStation', 'fmReference', 'fmDuration'].forEach(id => { document.getElementById(id).disabled = active || calibrationSending; });
+      let message = method === 'gsm' ? 'Ready. Automatic GSM900 search uses kalibrate’s FCCH detector. At least two stable channels must agree.' : 'Ready. Measure a known FM station to estimate the residual frequency error.';
+      if (!connected) message = 'Connect this receiver before calibration.';
+      else if (data.scanState !== 'STOPPED') message = 'Stop the spectrum scan before measuring.';
+      else if (client.tunerAgc || client.digitalAgc) message = 'Turn both tuner and digital AGC off before measuring.';
+      else if (active && result.method === 'gsm') message = (result.message || 'Starting GSM search') + ' · ' + result.progress + '% · ' + (result.channels || []).length + ' measured channels · ' + (result.acceptedFrames || 0) + ' bursts on current channel';
+      else if (result.status === 'ready' && result.method === 'gsm') message = 'GSM estimate: ' + result.estimatedPpm.toFixed(3) + ' ppm · within-run spread ±' + result.uncertaintyPpm.toFixed(3) + ' ppm' + '\\nCorrection: ' + result.basePpm + ' → ' + result.suggestedPpm + ' ppm · ' + result.elapsedSeconds + ' seconds' + '\\n' + result.channels.map(c => 'ARFCN ' + c.arfcn + ' (' + (c.referenceHz / 1e6).toFixed(1) + ' MHz): ' + c.estimatedPpm.toFixed(3) + ' ppm, ' + c.bursts + ' bursts').join('\\n') + (result.verification ? '\\nMeasured residuals: ' + result.verification.map(v => v.ppm + ' ppm → ' + v.rmsResidualPpm.toFixed(3) + ' ppm RMS').join('; ') : '') + '\\n' + result.message;
+      else if (active) message = 'Measuring ' + (result.referenceHz / 1e6).toFixed(3) + ' MHz: ' + result.progress + '% · ' +
+        (result.acceptedFrames || 0) + ' clean frames · ' + (result.rejectedFrames || 0) + ' rejected';
+      else if (result.status === 'ready') message = (result.referenceHz / 1e6).toFixed(3) + ' MHz · residual ' +
+        result.residualHz.toFixed(0) + ' Hz · estimated uncertainty ±' + result.uncertaintyPpm.toFixed(2) + ' ppm' +
+        '\\nCorrection: ' + result.basePpm + ' → ' + result.suggestedPpm + ' ppm · channel SNR ' + result.snrDb.toFixed(1) + ' dB' +
+        '\\n' + result.message + (!applicable && result.canApply ? ' Select the measured reference, or measure again if settings changed or the result expired.' : '');
+      else if (result.status === 'error') message = result.message;
+      else if (result.status === 'cancelled') message = 'Calibration cancelled. No correction was applied.';
+      document.getElementById('fmCalibrationResult').textContent = calibrationNotice || message;
+    }
+
+    async function runFmCalibration(action) {
+      const method = document.getElementById('calibrationMethod').value;
+      const referenceHz = Math.round(Number(document.getElementById('fmReference').value) * 1e6);
+      if (method === 'fm' && action === 'start' && (!Number.isFinite(referenceHz) || referenceHz < 87500000 || referenceHz > 108000000)) {
+        calibrationNotice = 'Enter a reference from 87.5 to 108 MHz.';
+        return fetchStatus();
+      }
+      calibrationSending = true;
+      calibrationNotice = '';
+      try {
+        const response = await fetch('/api/ppm-calibration', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: calibrationClientId, action, method, referenceHz, durationSeconds: Number(document.getElementById('fmDuration').value) }) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Calibration request failed');
+      } catch (error) { calibrationNotice = error.message; }
+      finally { calibrationSending = false; await fetchStatus(); }
+    }
+
+    async function applyFmCalibration() {
+      const client = currentRtlClients.find(item => item.id === calibrationClientId);
+      const result = client && client.calibration;
+      if (!result || !result.canApply) return;
+      calibrationSending = true;
+      const applied = await postRtlClientAction({ action: 'setPpmCorrection', id: client.id,
+        ppmCorrection: result.suggestedPpm, calibrationRevision: result.revision });
+      calibrationSending = false;
+      if (applied) {
+        calibrationClientId = null;
+        calibrationNotice = '';
+        document.getElementById('fmCalibration').hidden = true;
+      }
+      await fetchStatus();
+    }
 
     async function postRtlClientAction(payload) {
       const message = document.getElementById('rtlClientMessage');
@@ -3329,7 +3601,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         element.textContent = receiverProgressText(client);
       });
       const signature = JSON.stringify(clients.map(client => [client.id, client.name, client.host, client.port,
-        client.startMhz, client.stopMhz, client.slot, client.color, client.enabled, client.state, client.error]));
+        client.startMhz, client.stopMhz, client.ppmCorrection, client.tunerAgc, client.digitalAgc,
+        client.slot, client.color, client.enabled, client.state, client.error]));
       if (signature === renderedRtlClientSignature) return;
       renderedRtlClientSignature = signature;
       list.replaceChildren();
@@ -3378,9 +3651,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const remove = document.createElement('button');
         remove.type = 'button';
         remove.className = 'rtl-client-remove';
-        remove.textContent = client.id === 'rtl-client-1' ? 'Default' : 'Remove';
-        remove.disabled = client.id === 'rtl-client-1';
-        remove.title = client.id === 'rtl-client-1' ? 'Disable the default endpoint to stop using it' : 'Remove this rtl_tcp client';
+        remove.textContent = 'Remove';
+        remove.title = 'Remove this rtl_tcp client';
         remove.addEventListener('click', () => postRtlClientAction({ action: 'remove', id: client.id }));
 
         head.append(main, remove);
@@ -3429,7 +3701,51 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           const range = RANGE_PRESETS[rangeSelect.value];
           if (range) setRtlClientRange(client.id, range[0], range[1]);
         });
-        card.append(head, rangeSelect, customRange);
+        const ppmRow = document.createElement('div');
+        ppmRow.className = 'rtl-client-ppm-row';
+        const ppmLabel = document.createElement('label');
+        ppmLabel.textContent = 'PPM correction';
+        const ppmInput = document.createElement('input');
+        ppmInput.type = 'number';
+        ppmInput.min = '-1000';
+        ppmInput.max = '1000';
+        ppmInput.step = '1';
+        ppmInput.value = String(Number.isInteger(client.ppmCorrection) ? client.ppmCorrection : 0);
+        ppmInput.id = 'rtlPpm-' + client.id;
+        ppmInput.setAttribute('aria-label', client.name + ' PPM correction');
+        ppmLabel.htmlFor = ppmInput.id;
+        ppmLabel.title = 'Frequency correction in parts per million, applied at the next tuner retune';
+        const applyPpm = document.createElement('button');
+        applyPpm.type = 'button';
+        applyPpm.className = 'btn-scan';
+        applyPpm.textContent = 'APPLY';
+        applyPpm.addEventListener('click', () => setRtlClientPpmCorrection(client.id, ppmInput.value));
+        ppmRow.append(ppmLabel, ppmInput, applyPpm);
+        const calibrate = document.createElement('button');
+        calibrate.type = 'button';
+        calibrate.className = 'btn-scan';
+        calibrate.textContent = 'CALIBRATE';
+        calibrate.disabled = client.state !== 'CONNECTED';
+        calibrate.setAttribute('aria-label', 'Calibrate PPM for ' + client.name);
+        calibrate.addEventListener('click', () => openFmCalibration(client.id));
+        ppmRow.append(calibrate);
+        const agcRow = document.createElement('div');
+        agcRow.className = 'rtl-client-agc-row';
+        const createAgcToggle = (setting, labelText) => {
+          const label = document.createElement('label');
+          label.className = 'rtl-client-agc-toggle';
+          const toggle = document.createElement('input');
+          toggle.type = 'checkbox';
+          toggle.checked = !!client[setting];
+          toggle.setAttribute('aria-label', client.name + ' ' + labelText);
+          toggle.addEventListener('change', () => setRtlClientAgc(client.id, setting, toggle));
+          const text = document.createElement('span');
+          text.textContent = labelText;
+          label.append(toggle, text);
+          return label;
+        };
+        agcRow.append(createAgcToggle('tunerAgc', 'Tuner AGC'), createAgcToggle('digitalAgc', 'Digital AGC'));
+        card.append(head, rangeSelect, customRange, ppmRow, agcRow);
         list.appendChild(card);
       });
 
@@ -3453,6 +3769,24 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       maxHoldBuffers[client && client.slot || 'A'] = [];
       await postRtlClientAction({ action: 'setRange', id, startMhz: start, stopMhz: stop });
       syncHardwareAndZoom(true, false);
+    }
+
+    async function setRtlClientPpmCorrection(id, value) {
+      const ppmCorrection = Number(value);
+      if (!String(value).trim() || !Number.isInteger(ppmCorrection) || ppmCorrection < -1000 || ppmCorrection > 1000) {
+        const message = document.getElementById('rtlClientMessage');
+        if (message) message.textContent = 'Enter a whole-number PPM correction from -1000 to 1000';
+        return;
+      }
+      await postRtlClientAction({ action: 'setPpmCorrection', id, ppmCorrection });
+    }
+
+    async function setRtlClientAgc(id, setting, toggle) {
+      const payload = { action: 'setAgc' };
+      payload[setting] = toggle.checked;
+      toggle.disabled = true;
+      await postRtlClientAction(Object.assign({ id }, payload));
+      toggle.disabled = false;
     }
 
     async function addRtlClient(event) {
@@ -3483,7 +3817,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const statusQuery = new URLSearchParams({
           minHz: String(Math.round(viewStartMhz * 1e6)),
           maxHz: String(Math.round(viewEndMhz * 1e6)),
-          pixels: String(Math.ceil(plotPixels))
+          pixels: String(Math.ceil(plotPixels)),
+          fftDisplay: fftDisplayMode
         });
         const res = await fetch('/api/status?' + statusQuery.toString());
         if (!res.ok) return;
@@ -3491,6 +3826,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
         const isConnected = data.connectionState === 'CONNECTED';
         renderRtlClients(data.rtlClients || []);
+        renderFmCalibration(data);
 
         const statusEl = document.getElementById('statusText');
         if (statusEl) {
@@ -3608,6 +3944,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           btn.disabled = true;
           btn.className = 'btn-scan btn-disabled';
           btn.innerText = 'ENABLE A RECEIVER TO SCAN';
+        } else if (activeClients.some(client => ['queued', 'measuring'].includes(client.calibration?.status))) {
+          btn.disabled = true;
+          btn.className = 'btn-scan btn-disabled';
+          btn.innerText = 'PPM CALIBRATION IN PROGRESS';
         } else if (isScanning) {
           btn.disabled = false;
           btn.className = 'btn-stop';
@@ -3777,6 +4117,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     }
 
     window.addEventListener('DOMContentLoaded', async () => {
+      syncFftDisplayModeButtons();
       initChart();
       await hydrateFromServer();
       updateCardActiveStyles();
@@ -3809,6 +4150,12 @@ function startWebServer() {
       res.end(JSON.stringify({ success: false, error: 'View-only: controls are limited to the host computer' }));
       return;
     }
+    if (req.method === 'POST' && calibrationBusy() && urlPath !== '/api/ppm-calibration') {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, error: 'Cancel calibration before changing scanner controls' }));
+      return;
+    }
+    if (urlPath === '/api/ppm-calibration' && req.method === 'POST') return handleCalibrationRequest(req, res);
     if (urlPath === '/api/status' && req.method === 'GET') {
       const requestUrl = new URL(req.url, 'http://localhost');
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3820,7 +4167,8 @@ function startWebServer() {
         nativeTraces: nativeTracesForViewport(
           requestUrl.searchParams.get('minHz'),
           requestUrl.searchParams.get('maxHz'),
-          requestUrl.searchParams.get('pixels')
+          requestUrl.searchParams.get('pixels'),
+          requestUrl.searchParams.get('fftDisplay')
         ),
         rtlClients: rtlClientsForStatus(),
         controlAllowed
@@ -3870,6 +4218,9 @@ function startWebServer() {
               port,
               startMhz: RTL_SLOT_RANGES[RTL_SLOTS[appState.rtlClients.length] || 'F'][0],
               stopMhz: RTL_SLOT_RANGES[RTL_SLOTS[appState.rtlClients.length] || 'F'][1],
+              ppmCorrection: 0,
+              tunerAgc: DEFAULT_TUNER_AGC,
+              digitalAgc: DEFAULT_DIGITAL_AGC,
               enabled: false,
               state: 'DISCONNECTED'
             };
@@ -3927,6 +4278,85 @@ function startWebServer() {
                   else requestBridge(runtime, '/configuration', configuration);
                 }
               }
+            } else if (payload.action === 'setAgc') {
+              const agcSettings = {};
+              for (const setting of ['tunerAgc', 'digitalAgc']) {
+                if (Object.prototype.hasOwnProperty.call(payload, setting)) {
+                  if (typeof payload[setting] !== 'boolean') {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'AGC settings must be true or false' }));
+                    return;
+                  }
+                  agcSettings[setting] = payload[setting];
+                }
+              }
+              if (Object.keys(agcSettings).length === 0) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Choose a tuner or digital AGC setting' }));
+                return;
+              }
+              const previousAgcSettings = {
+                tunerAgc: client.tunerAgc,
+                digitalAgc: client.digitalAgc
+              };
+              Object.assign(client, agcSettings);
+              if (!saveRtlClientProfiles()) {
+                Object.assign(client, previousAgcSettings);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Could not save receiver AGC settings on this host' }));
+                return;
+              }
+              const runtime = rtlClientRuntimes.get(client.id);
+              if (runtime) {
+                requestBridge(runtime, '/configuration', agcSettings, bridgeResponse => {
+                  syncRtlConnectionState();
+                  if (!bridgeResponse || bridgeResponse.statusCode !== 200) {
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'AGC setting was saved but could not be applied yet; it will apply after reconnect' }));
+                    return;
+                  }
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true, rtlClients: rtlClientsForStatus(), connectionState: appState.connectionState }));
+                });
+                return;
+              }
+            } else if (payload.action === 'setPpmCorrection') {
+              const ppmCorrection = payload.ppmCorrection;
+              if (typeof ppmCorrection !== 'number' || !Number.isInteger(ppmCorrection) || ppmCorrection < -1000 || ppmCorrection > 1000) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'PPM correction must be a whole number from -1000 to 1000' }));
+                return;
+              }
+              if (payload.calibrationRevision !== undefined) {
+                const error = calibrationApplyError(client, rtlClientRuntimes.get(client.id), payload.calibrationRevision, ppmCorrection);
+                if (error) {
+                  res.writeHead(409, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: false, error }));
+                  return;
+                }
+              }
+              const previousPpmCorrection = normalizePpmCorrection(client.ppmCorrection);
+              client.ppmCorrection = ppmCorrection;
+              if (!saveRtlClientProfiles()) {
+                client.ppmCorrection = previousPpmCorrection;
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Could not save receiver PPM correction on this host' }));
+                return;
+              }
+              const runtime = rtlClientRuntimes.get(client.id);
+              if (runtime) {
+                requestBridge(runtime, '/configuration', { ppmCorrection }, bridgeResponse => {
+                  syncRtlConnectionState();
+                  if (!bridgeResponse || bridgeResponse.statusCode !== 200) {
+                    res.writeHead(502, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: 'PPM correction was saved but could not be applied yet; it will apply after reconnect' }));
+                    return;
+                  }
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true, rtlClients: rtlClientsForStatus(), connectionState: appState.connectionState }));
+                });
+                return;
+              }
             } else if (payload.action === 'setEnabled') {
               client.enabled = !!payload.enabled;
               delete client.error;
@@ -3942,11 +4372,6 @@ function startWebServer() {
                 }
               }
             } else if (payload.action === 'remove') {
-              if (client.id === 'rtl-client-1') {
-                res.writeHead(409, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success: false, error: 'Disable the default receiver instead of removing it' }));
-                return;
-              }
               const clientIndex = appState.rtlClients.indexOf(client);
               stopRtlTcpClient(client.id);
               appState.rtlClients = appState.rtlClients.filter(item => item.id !== client.id);
@@ -3966,7 +4391,7 @@ function startWebServer() {
               }
             } else {
               res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: false, error: 'Action must be add, setRange, setEnabled, or remove' }));
+              res.end(JSON.stringify({ success: false, error: 'Action must be add, setRange, setPpmCorrection, setAgc, setEnabled, or remove' }));
               return;
             }
           }
@@ -4036,6 +4461,28 @@ function startWebServer() {
           res.end(JSON.stringify({ success: true, scanState: appState.scanState, scansCaptured: appState.scansCaptured }));
         } catch (e) {
           res.writeHead(400); res.end();
+        }
+      });
+    } else if (urlPath === '/api/settle-time' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        try {
+          const payload = JSON.parse(body);
+          const settleMs = Number(payload.settleMs);
+          if (!Number.isInteger(settleMs) || settleMs < RTL_SETTLE_MIN_MS || settleMs > RTL_SETTLE_MAX_MS) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: false, error: 'Retune wait must be an integer from 10 to 2000 ms' }));
+            return;
+          }
+          appState.settleMs = settleMs;
+          broadcastBridgeRequest('/configuration', { settleMs });
+          console.log(`[RTL SETTLE] Retune wait set to ${settleMs} ms`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, settleMs: appState.settleMs }));
+        } catch (error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Invalid request body' }));
         }
       });
     } else if (req.url === '/api/range' && req.method === 'POST') {
@@ -4337,7 +4784,7 @@ function startWebServer() {
     console.log('  RTL-SDR Web Spectrum Scanner');
     console.log('===========================================================');
     console.log(`  [+] Web Dashboard : http://localhost:${WEB_PORT}`);
-    console.log(`  [+] rtl_tcp node  : ${RTL_TCP_HOST}:${RTL_TCP_PORT}`);
+    console.log('  [+] rtl_tcp nodes : managed from the dashboard');
     console.log(`  [+] LAN control   : ${REMOTE_CONTROL ? 'enabled' : 'VIEW-ONLY for other devices (RTL_REMOTE_CONTROL=0)'}`);
     console.log(`  [+] Chart library : ${fs.existsSync(CHART_JS_LOCAL) ? 'local (offline-capable)' : 'CDN (needs internet - see README)'}`);
     console.log('  [+] Engine logs   : server console');

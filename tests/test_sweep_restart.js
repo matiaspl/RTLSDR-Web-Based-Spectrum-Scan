@@ -9,6 +9,8 @@ const runtime = { clientId: 'a', commandEpoch: 0, lastSweepComplete: true };
 const context = {
   appState: { scanMode: 'CONTINUOUS', scanState: 'SCANNING', rtlClients: [] },
   sourceTraces: { a: [-20] },
+  nativeSourceTraces: { a: { values: [-20], passId: 7 } },
+  emptyNativeTrace: () => ({ values: null, passId: null }),
   requestBridge: (...args) => requests.push(args),
   syncRtlConnectionState: () => {}
 };
@@ -19,6 +21,8 @@ assert.equal(runtime.commandEpoch, 1);
 assert.equal(runtime.pendingSweepStart, true);
 assert.equal(runtime.lastSweepComplete, false);
 assert.equal(context.sourceTraces.a.length, 0);
+assert.equal(context.nativeSourceTraces.a.values, null);
+assert.equal(context.nativeSourceTraces.a.passId, null);
 assert.equal(requests.length, 1);
 assert.equal(requests[0][1], '/configuration');
 assert.equal(requests[0][2].repeat, 255);
