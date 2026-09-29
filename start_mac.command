@@ -58,6 +58,9 @@ PYTHON_VERSION=$(python3 --version)
 echo "[✓] Python is ready: $PYTHON_VERSION"
 echo ""
 
+echo "Local USB mode also needs soapy_power and the SoapySDR RTL-SDR driver."
+echo "Remote SSH mode needs these packages on the receiver host instead."
+
 # 3. Open browser after a brief startup delay
 (
     sleep 2

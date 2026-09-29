@@ -3,11 +3,11 @@ const dgram = require('dgram');
 const os = require('os');
 const crypto = require('crypto');
 
-const WEB_PORT = 8000;
+const WEB_PORT = Number(process.env.WEB_PORT || 8080);
 const SLP_PORT = 8427;
 const SLP_MULTICAST_ADDR = '239.255.254.253';
 const DEFAULT_TUNER_AGC = process.env.RTL_TUNER_AGC === '1';
-const DEFAULT_DIGITAL_AGC = process.env.RTL_DIGITAL_AGC === '1';
+const DEFAULT_DIGITAL_AGC = false; // No separate digital AGC control in this spectrum backend.
 const RTL_SETTLE_MIN_MS = 10;
 const RTL_SETTLE_MAX_MS = 2000;
 const configuredRtlSettleMs = Number(process.env.RTL_SETTLE_MS || '30');
@@ -29,7 +29,7 @@ let appState = {
   inputLabel: 'RTL-SDR',
   rtlClients: [],
   scanState: 'STOPPED', // 'STOPPED' | 'SCANNING'
-  status: 'NO RTL_TCP CLIENTS ENABLED',
+  status: 'NO RECEIVERS ENABLED',
   scansCaptured: 0,
   lastScanTime: null,
   startFreqMhz: 470.0,
@@ -136,10 +136,9 @@ const ENGINE_DIR = path.join(__dirname, 'engine');
 // which the SoundBase AD600 plugin also uses.
 const SCRATCH_DIR = process.env.AD600_ENGINE_SCRATCH || path.join(os.homedir(), '.ad600_node_app');
 const CMD_FILE = path.join(SCRATCH_DIR, 'console_cmd.txt');
-const RTL_CLIENT_CONFIG_FILE = path.join(os.homedir(), '.rtl_tcp_spectrum_scanner', 'clients.json');
+const RTL_CLIENT_CONFIG_FILE = process.env.SOAPY_CLIENT_CONFIG_FILE || path.join(os.homedir(), '.soapy_power_spectrum_scanner', 'clients.json');
 const PYTHON_BIN = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
-const BRIDGE_PORT = 8088;
-// The rtl_tcp IQ stream is not calibrated to absolute input power.
+// Soapy power density is converted to relative FFT-bin power; no absolute RF calibration.
 const TRACE_FLOOR_DBFS = -125.0;
 const TRACE_CEILING_DBFS = 10.0;
 
@@ -154,6 +153,7 @@ const ANT_COLORS = {
 };
 
 const RTL_CLIENT_LIMIT = 6;
+const retiringSoapyProcesses = new Map();
 const NATIVE_TRACE_BLOCK_SIZE = 64;
 const configuredRtlSampleRate = Number.parseInt(process.env.RTL_SAMPLE_RATE || '1800000', 10);
 const RTL_SAMPLE_RATE_HZ = Number.isFinite(configuredRtlSampleRate) ? configuredRtlSampleRate : 1800000;
@@ -387,7 +387,6 @@ function rtlClientsForStatus() {
 }
 
 const rtlClientRuntimes = new Map();
-let nextBridgePort = BRIDGE_PORT;
 
 function calibrationBusy() {
   return Array.from(rtlClientRuntimes.values()).some(runtime => runtime.calibrationPending ||
@@ -558,6 +557,28 @@ function enabledRtlClients() {
   return appState.rtlClients.filter(client => client.enabled);
 }
 
+function normalizeReceiverProfile(entry) {
+  const mode = entry.mode;
+  const serial = String(entry.serial || '').trim();
+  const host = mode === 'local' ? 'localhost' : String(entry.host || '').trim();
+  const port = mode === 'local' ? 0 : Number(entry.port || 22);
+  const sshUser = mode === 'local' ? '' : String(entry.sshUser || '').trim();
+  if (!['local', 'remote'].includes(mode)) throw new Error('Choose Local USB or Remote SSH');
+  if (serial && !/^[A-Za-z0-9_.-]{1,64}$/.test(serial)) throw new Error('Enter a USB serial containing letters, numbers, dots, hyphens or underscores');
+  if (mode === 'remote' && (!/^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$/.test(host) ||
+      !Number.isInteger(port) || port < 1 || port > 65535 ||
+      (sshUser && !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(sshUser)))) {
+    throw new Error('Enter a valid SSH host, user and port (1–65535)');
+  }
+  return { mode, serial, host, port, sshUser };
+}
+
+function receiversConflict(a, b) {
+  const sameHost = a.mode === b.mode && (a.mode === 'local' ||
+    (a.host.toLowerCase() === b.host.toLowerCase() && a.port === b.port));
+  return sameHost && (!a.serial || !b.serial || a.serial === b.serial);
+}
+
 function loadRtlClientProfiles() {
   try {
     const saved = JSON.parse(fs.readFileSync(RTL_CLIENT_CONFIG_FILE, 'utf8'));
@@ -566,18 +587,15 @@ function loadRtlClientProfiles() {
     for (const entry of saved) {
       if (!entry || typeof entry !== 'object') continue;
       const name = String(entry.name || '').trim().slice(0, 64);
-      const host = String(entry.host || '').trim();
-      const port = Number.parseInt(entry.port, 10);
+      let endpoint;
+      try { endpoint = normalizeReceiverProfile(entry); } catch (_) { continue; }
       const id = String(entry.id || '');
-      if (!id || id === 'rtl-client-1' || !name || !host || /\s/.test(host) ||
-          host.length > 253 || !Number.isInteger(port) || port < 1 || port > 65535) continue;
-      if (profiles.some(client => client.id === id ||
-            (client.host.toLowerCase() === host.toLowerCase() && client.port === port))) continue;
+      if (!id || !name || profiles.some(client => client.id === id || receiversConflict(client, endpoint))) continue;
       const [startMhz, stopMhz] = clientRange(entry, profiles.length);
-      profiles.push({ id, name, host, port, startMhz, stopMhz,
+      profiles.push({ id, name, ...endpoint, startMhz, stopMhz,
         ppmCorrection: normalizePpmCorrection(entry.ppmCorrection),
         tunerAgc: normalizeAgcSetting(entry.tunerAgc, DEFAULT_TUNER_AGC),
-        digitalAgc: normalizeAgcSetting(entry.digitalAgc, DEFAULT_DIGITAL_AGC),
+        digitalAgc: false,
         enabled: false, state: 'DISCONNECTED' });
       if (profiles.length >= RTL_CLIENT_LIMIT) break;
     }
@@ -591,7 +609,8 @@ function loadRtlClientProfiles() {
 
 function saveRtlClientProfiles() {
   const profiles = appState.rtlClients.map(client => ({
-    id: client.id, name: client.name, host: client.host, port: client.port,
+    id: client.id, name: client.name, mode: client.mode, serial: client.serial,
+    host: client.host, port: client.port, sshUser: client.sshUser,
     startMhz: client.startMhz, stopMhz: client.stopMhz,
     ppmCorrection: normalizePpmCorrection(client.ppmCorrection),
     tunerAgc: !!client.tunerAgc, digitalAgc: !!client.digitalAgc
@@ -615,44 +634,48 @@ function syncRtlConnectionState() {
     appState.endFreqMhz = Math.max(...ranges.map(range => range[1]));
     appState.grid = gridForRange(appState.startFreqMhz, appState.endFreqMhz, appState.rbwHz);
   }
-  const connected = enabled.filter(client => client.state === 'CONNECTED').length;
+  const connected = enabled.filter(client => ['CONNECTED', 'READY'].includes(client.state)).length;
+  const failed = enabled.filter(client => client.state === 'ERROR');
+  if (enabled.length && failed.length === enabled.length) appState.scanState = 'STOPPED';
   appState.connectionState = enabled.length === 0
     ? 'DISCONNECTED'
     : (connected === enabled.length ? 'CONNECTED' : 'CONNECTING');
   appState.activeTargetIp = enabled.length ? enabled[0].host : null;
   appState.inputLabel = enabled.map(client => client.name).join(', ') || 'RTL-SDR';
 
-  if (appState.scanState === 'SCANNING') {
-    appState.status = `SCANNING ${enabled.length} RTL_TCP RECEIVER${enabled.length === 1 ? '' : 'S'}`;
+  if (failed.length) {
+    appState.status = `${failed.length} RECEIVER ERROR${failed.length === 1 ? '' : 'S'} — see antenna details`;
+  } else if (appState.scanState === 'SCANNING') {
+    appState.status = `SCANNING ${enabled.length} RECEIVER${enabled.length === 1 ? '' : 'S'}`;
   } else if (enabled.length === 0) {
-    appState.status = 'NO RTL_TCP CLIENTS ENABLED';
+    appState.status = 'NO RECEIVERS ENABLED';
   } else if (connected === enabled.length) {
-    appState.status = `${connected} RTL_TCP RECEIVER${connected === 1 ? '' : 'S'} CONNECTED - READY`;
+    appState.status = `${connected} RECEIVER${connected === 1 ? '' : 'S'} READY — START A SCAN TO OPEN RECEIVERS`;
   } else {
-    appState.status = `CONNECTING TO ${enabled.length} RTL_TCP RECEIVER${enabled.length === 1 ? '' : 'S'} (${connected} CONNECTED)...`;
+    appState.status = `CONNECTING TO ${enabled.length} RECEIVER${enabled.length === 1 ? '' : 'S'} (${connected} CONNECTED)...`;
   }
 }
 
-function allocateBridgePort() {
-  const allocated = new Set(Array.from(rtlClientRuntimes.values(), runtime => runtime.bridgePort));
-  while (allocated.has(nextBridgePort)) nextBridgePort++;
-  const port = nextBridgePort++;
-  if (nextBridgePort > 65000) nextBridgePort = BRIDGE_PORT;
-  return port;
-}
-
-function startRtlTcpClient(client) {
+function startSoapyClient(client) {
   if (!client || !client.enabled || rtlClientRuntimes.has(client.id)) return;
+  const retiring = retiringSoapyProcesses.get(client.id);
+  if (retiring) {
+    client.state = 'CONNECTING';
+    retiring.then(() => startSoapyClient(client));
+    return;
+  }
   nativeSourceTraces[client.id] = emptyNativeTrace();
   const [startMhz, stopMhz] = clientRange(client);
   const clientGrid = gridForRange(startMhz, stopMhz, appState.rbwHz);
-  const bridgePort = allocateBridgePort();
-  const backendPath = path.join(ENGINE_DIR, 'rtl_tcp_backend.py');
+  const bridgePort = null; // The backend reports an OS-assigned localhost port at startup.
+  const backendPath = path.join(ENGINE_DIR, 'soapy_power_backend.py');
   const env = Object.assign({}, process.env, {
     PYTHONUNBUFFERED: '1',
-    RTL_TCP_HOST: client.host,
-    RTL_TCP_PORT: String(client.port),
-    RTL_BRIDGE_PORT: String(bridgePort),
+    SOAPY_PROFILE: JSON.stringify({ mode: client.mode, serial: client.serial, host: client.host,
+      port: client.port, sshUser: client.sshUser,
+      binary: client.mode === 'remote' ? (process.env.SOAPY_REMOTE_BIN || 'soapy_power') : (process.env.SOAPY_POWER_BIN || 'soapy_power'),
+      remotePython: process.env.SOAPY_REMOTE_PYTHON || 'python3' }),
+    RTL_BRIDGE_PORT: '0',
     RTL_SAMPLE_RATE: String(process.env.RTL_SAMPLE_RATE || 1800000),
     RTL_PPM_CORRECTION: String(normalizePpmCorrection(client.ppmCorrection)),
     RTL_SETTLE_MS: String(appState.settleMs),
@@ -682,7 +705,7 @@ function startRtlTcpClient(client) {
   runtime.proc = proc;
   rtlClientRuntimes.set(client.id, runtime);
   client.state = 'CONNECTING';
-  console.log(`[RTL TCP] Starting client ${client.name} at ${client.host}:${client.port}`);
+  console.log(`[SOAPY] Starting client ${client.name} at ${client.host}:${client.port}`);
   let stdoutBuffer = '';
   proc.stdout.on('data', data => {
     if (rtlClientRuntimes.get(client.id) !== runtime) return;
@@ -693,10 +716,13 @@ function startRtlTcpClient(client) {
       const line = raw.trim();
       if (!line) continue;
       console.log(`[RTL ${client.name}]`, line);
-      if (line.startsWith('[RTL TCP] CONNECTED')) {
-        client.state = 'CONNECTED';
+      if (line.startsWith('[SOAPY] READY')) {
+        const address = line.match(/bridge=127\.0\.0\.1:(\d+)/);
+        if (!address) continue;
+        runtime.bridgePort = Number(address[1]);
+        client.state = 'READY';
         syncRtlConnectionState();
-      } else if (line.startsWith('[RTL TCP] DISCONNECTED') || line.startsWith('[RTL TCP] CONNECTING')) {
+      } else if (line.startsWith('[SOAPY] DISCONNECTED') || line.startsWith('[SOAPY] CONNECTING')) {
         client.state = 'RECONNECTING';
         syncRtlConnectionState();
       }
@@ -716,7 +742,8 @@ function startRtlTcpClient(client) {
     if (rtlClientRuntimes.get(client.id) !== runtime) return;
     rtlClientRuntimes.delete(client.id);
     clearInterval(runtime.pollInterval);
-    client.state = 'DISCONNECTED';
+    client.state = 'ERROR';
+    client.error = `Spectrum backend exited (${code})`;
     if (appState.scanState === 'SCANNING' && enabledRtlClients().length === 0) appState.scanState = 'STOPPED';
     syncRtlConnectionState();
   });
@@ -724,12 +751,18 @@ function startRtlTcpClient(client) {
   syncRtlConnectionState();
 }
 
-function stopRtlTcpClient(clientId) {
+function stopSoapyClient(clientId) {
   const runtime = rtlClientRuntimes.get(clientId);
   rtlClientRuntimes.delete(clientId);
   if (runtime) {
     clearInterval(runtime.pollInterval);
-    try { runtime.proc.kill('SIGTERM'); } catch (e) {}
+    const retiring = new Promise(resolve => {
+      if (runtime.proc.exitCode !== null || runtime.proc.signalCode) return resolve();
+      runtime.proc.once('close', resolve);
+      try { runtime.proc.kill('SIGTERM'); } catch (_) { resolve(); }
+    });
+    retiringSoapyProcesses.set(clientId, retiring);
+    retiring.then(() => { if (retiringSoapyProcesses.get(clientId) === retiring) retiringSoapyProcesses.delete(clientId); });
   }
   sourceTraces[clientId] = [];
   nativeSourceTraces[clientId] = emptyNativeTrace();
@@ -740,6 +773,11 @@ function stopRtlTcpClient(clientId) {
 
 function requestBridge(runtime, path, payload, callback, retryCount = 0, epoch = runtime.commandEpoch) {
   if (rtlClientRuntimes.get(runtime.clientId) !== runtime || runtime.commandEpoch !== epoch) return;
+  if (!runtime.bridgePort) {
+    if (retryCount < 50) setTimeout(() => requestBridge(runtime, path, payload, callback, retryCount + 1, epoch), 100);
+    else if (callback) callback(null, 'Spectrum backend did not start');
+    return;
+  }
   const postData = payload === undefined ? null : JSON.stringify(payload);
   const options = {
     hostname: '127.0.0.1',
@@ -777,6 +815,8 @@ function broadcastBridgeRequest(path, payload, callback) {
 // Configure and restart in order. Ignore polls from before this command, including a previous
 // single sweep's completion, until the bridge has acknowledged the new run.
 function restartRtlSweep(runtime, configuration = {}) {
+  const restartingClient = appState.rtlClients.find(item => item.id === runtime.clientId);
+  if (restartingClient) { restartingClient.state = 'STARTING'; delete restartingClient.error; }
   runtime.commandEpoch++;
   runtime.pendingSweepStart = true;
   runtime.lastSweepComplete = false;
@@ -829,7 +869,7 @@ setInterval(() => {
 
 function startBridgePolling(runtime) {
   runtime.pollInterval = setInterval(() => {
-    if (rtlClientRuntimes.get(runtime.clientId) !== runtime || runtime.pollInFlight) return;
+    if (rtlClientRuntimes.get(runtime.clientId) !== runtime || runtime.pollInFlight || !runtime.bridgePort) return;
     runtime.pollInFlight = true;
     const pollEpoch = runtime.commandEpoch;
     const afterSweepId = Number.isInteger(runtime.lastProcessedSweepId) ? runtime.lastProcessedSweepId : -1;
@@ -842,6 +882,12 @@ function startBridgePolling(runtime) {
             pollEpoch !== runtime.commandEpoch || runtime.pendingSweepStart) return;
         try {
           const json = JSON.parse(body);
+          const client = appState.rtlClients.find(item => item.id === runtime.clientId);
+          if (client && json.state) {
+            client.state = json.state;
+            client.error = json.error || null;
+            syncRtlConnectionState();
+          }
           if (!runtime.calibrationPending && json.calibration) runtime.calibration = json.calibration;
           runtime.progress = json.sweeping ? json.progress : null;
           const expectedGrid = runtime.grid;
@@ -856,7 +902,7 @@ function startBridgePolling(runtime) {
             };
           }
           if (appState.scanState !== 'SCANNING' || !gridMatchesConfig) return;
-          const series = json.series[0];
+          const series = (json.series || [])[0];
           const updates = Array.isArray(json.updates) ? json.updates : [];
           let nativeTrace = nativeSourceTraces[runtime.clientId] || emptyNativeTrace();
           for (const update of updates) {
@@ -881,7 +927,7 @@ function startBridgePolling(runtime) {
           nativeSourceTraces[runtime.clientId] = nativeTrace;
           if (json.sweepId !== undefined && json.sweepId !== runtime.lastProcessedSweepId) {
             runtime.lastProcessedSweepId = json.sweepId;
-            runtime.lastSweepComplete = json.sweeping === false;
+            runtime.lastSweepComplete = json.sweeping === false && json.coverageComplete === true && !json.error;
             const rawAmps = (series && series.amplitudesDbfs) || [];
             const coverage = series && series.coverage;
             const previous = sourceTraces[runtime.clientId] || [];
@@ -900,7 +946,7 @@ function startBridgePolling(runtime) {
           if (appState.scanMode === 'SINGLE' && enabledRtlClients().length > 0 &&
               enabledRtlClients().every(client => {
                 const activeRuntime = rtlClientRuntimes.get(client.id);
-                return activeRuntime && activeRuntime.lastSweepComplete;
+                return client.state === 'ERROR' || (activeRuntime && activeRuntime.lastSweepComplete);
               })) {
             appState.scanState = 'STOPPED';
             for (const runtime of rtlClientRuntimes.values()) {
@@ -908,7 +954,6 @@ function startBridgePolling(runtime) {
               runtime.pendingSweepStart = false;
               runtime.progress = null;
             }
-            broadcastBridgeRequest('/sweep/stop');
             syncRtlConnectionState();
           }
         } catch (e) {}
@@ -919,10 +964,10 @@ function startBridgePolling(runtime) {
   }, 200);
 }
 
-function stopAllRtlTcpClients() {
+function stopAllSoapyClients() {
   for (const client of appState.rtlClients) {
     client.enabled = false;
-    stopRtlTcpClient(client.id);
+    stopSoapyClient(client.id);
   }
   appState.antennaBiasPending = {};
 }
@@ -1158,6 +1203,9 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       gap: 8px;
     }
 
+    .rtl-client-add-row { flex-wrap: wrap; }
+    .rtl-client-add-row [hidden] { display: none; }
+    .rtl-client-add-row select { padding: 6px; color: var(--text-main); background: var(--bg-dark); border: 1px solid var(--border); border-radius: 4px; }
     .rtl-client-manager-header { justify-content: space-between; margin-bottom: 7px; }
     .rtl-client-hint, .rtl-client-endpoint { color: var(--text-muted); font-size: 11px; }
     .rtl-client-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); gap: 6px; }
@@ -1834,7 +1882,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     <div class="header-right" style="display: flex; flex-direction: column; align-items: flex-end; gap: 5px;">
       <div class="status-badge">
         <div id="statusDot" class="status-dot"></div>
-        <span id="statusText">NO RTL_TCP CLIENTS ENABLED</span>
+        <span id="statusText">NO RECEIVERS ENABLED</span>
       </div>
       <span class="view-only-badge" title="Controls are limited to the host computer (RTL_REMOTE_CONTROL=0)">VIEW ONLY</span>
     </div>
@@ -1905,15 +1953,19 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       <section class="rtl-client-manager" aria-label="Antennas">
         <div class="rtl-client-manager-header">
           <label class="control-label">Antennas</label>
-          <span class="rtl-client-hint">Manage up to six rtl_tcp receivers. Each antenna has its own color and frequency range; enabled antennas scan together.</span>
+          <span class="rtl-client-hint">Use up to six local USB or remote SSH receivers. Spectrum processing runs beside each dongle. Each antenna has its own color and frequency range; enabled antennas scan together.</span>
         </div>
         <div id="rtlClientList" class="rtl-client-list"></div>
         <form id="rtlClientForm" class="rtl-client-add-row" onsubmit="addRtlClient(event)">
           <input id="rtlClientName" type="text" maxlength="64" placeholder="Antenna name" value="RTL-SDR" required>
-          <input id="rtlClientHost" type="text" maxlength="253" placeholder="rtl-sdr.local or 192.168.1.20" required>
-          <input id="rtlClientPort" type="number" min="1" max="65535" value="1234" aria-label="rtl_tcp port" required>
+          <select id="soapyMode" aria-label="Receiver mode" onchange="updateSoapyMode()"><option value="local">Local USB</option><option value="remote">Remote SSH</option></select>
+          <input id="soapySerial" type="text" maxlength="64" placeholder="USB serial (optional)" aria-label="USB serial">
+          <input id="rtlClientHost" type="text" maxlength="253" placeholder="SSH host" aria-label="SSH host" hidden>
+          <input id="soapySshUser" type="text" maxlength="64" placeholder="SSH user (optional)" aria-label="SSH user" hidden>
+          <input id="rtlClientPort" type="number" min="1" max="65535" value="22" aria-label="SSH port" hidden>
           <button class="btn-scan" type="submit" style="padding: 5px 11px; font-size: 11px;">ADD ANTENNA</button>
         </form>
+        <p id="soapyModeHint" class="rtl-client-hint">Local USB: install soapy_power and the SoapySDR RTL-SDR driver on this computer. Leave serial blank for one dongle.</p>
         <div id="rtlClientMessage" role="status" aria-live="polite"></div>
         <section id="fmCalibration" class="fm-calibration" aria-label="PPM calibration" hidden>
           <strong id="fmCalibrationTitle">PPM calibration</strong>
@@ -2193,7 +2245,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="stat-label">Active rtl_tcp Host</div>
+      <div class="stat-label">Acquisition Host</div>
       <div class="stat-value" id="targetIp">--.--.--.--</div>
     </div>
     <div class="stat-card">
@@ -3575,12 +3627,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           body: JSON.stringify(payload)
         });
         const data = await res.json();
-        if (!res.ok || !data.success) throw new Error(data.error || 'Could not update rtl_tcp client list');
+        if (!res.ok || !data.success) throw new Error(data.error || 'Could not update soapy_power client list');
         if (message) message.textContent = '';
         await fetchStatus();
         return true;
       } catch (e) {
-        if (message) message.textContent = e.message || 'Could not update rtl_tcp client list';
+        if (message) message.textContent = e.message || 'Could not update soapy_power client list';
         return false;
       }
     }
@@ -3600,7 +3652,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const client = clients.find(item => item.id === element.dataset.progressClient);
         element.textContent = receiverProgressText(client);
       });
-      const signature = JSON.stringify(clients.map(client => [client.id, client.name, client.host, client.port,
+      const signature = JSON.stringify(clients.map(client => [client.id, client.name, client.mode, client.serial, client.sshUser, client.host, client.port,
         client.startMhz, client.stopMhz, client.ppmCorrection, client.tunerAgc, client.digitalAgc,
         client.slot, client.color, client.enabled, client.state, client.error]));
       if (signature === renderedRtlClientSignature) return;
@@ -3636,7 +3688,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         name.textContent = client.name;
         const endpoint = document.createElement('span');
         endpoint.className = 'rtl-client-endpoint';
-        endpoint.textContent = (client.host.includes(':') ? '[' + client.host + ']' : client.host) + ':' + client.port;
+        endpoint.textContent = (client.mode === 'local' ? 'Local USB' : 'Remote SSH · ' + (client.sshUser ? client.sshUser + '@' : '') + client.host + ':' + client.port) + (client.serial ? ' · ' + client.serial : ' · default dongle');
         const state = document.createElement('span');
         state.className = 'rtl-client-state' + (client.state === 'CONNECTED' ? ' connected' : (client.state === 'ERROR' ? ' error' : ''));
         state.textContent = client.error ? ('Error: ' + client.error) : (client.state === 'RECONNECTING' ? 'Reconnecting' : (client.state || 'DISCONNECTED'));
@@ -3652,7 +3704,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         remove.type = 'button';
         remove.className = 'rtl-client-remove';
         remove.textContent = 'Remove';
-        remove.title = 'Remove this rtl_tcp client';
+        remove.title = 'Remove this soapy_power client';
         remove.addEventListener('click', () => postRtlClientAction({ action: 'remove', id: client.id }));
 
         head.append(main, remove);
@@ -3714,21 +3766,13 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         ppmInput.id = 'rtlPpm-' + client.id;
         ppmInput.setAttribute('aria-label', client.name + ' PPM correction');
         ppmLabel.htmlFor = ppmInput.id;
-        ppmLabel.title = 'Frequency correction in parts per million, applied at the next tuner retune';
+        ppmLabel.title = 'Manual frequency correction. Applying it restarts acquisition; automatic IQ calibration is unavailable in these modes.';
         const applyPpm = document.createElement('button');
         applyPpm.type = 'button';
         applyPpm.className = 'btn-scan';
         applyPpm.textContent = 'APPLY';
         applyPpm.addEventListener('click', () => setRtlClientPpmCorrection(client.id, ppmInput.value));
         ppmRow.append(ppmLabel, ppmInput, applyPpm);
-        const calibrate = document.createElement('button');
-        calibrate.type = 'button';
-        calibrate.className = 'btn-scan';
-        calibrate.textContent = 'CALIBRATE';
-        calibrate.disabled = client.state !== 'CONNECTED';
-        calibrate.setAttribute('aria-label', 'Calibrate PPM for ' + client.name);
-        calibrate.addEventListener('click', () => openFmCalibration(client.id));
-        ppmRow.append(calibrate);
         const agcRow = document.createElement('div');
         agcRow.className = 'rtl-client-agc-row';
         const createAgcToggle = (setting, labelText) => {
@@ -3744,7 +3788,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           label.append(toggle, text);
           return label;
         };
-        agcRow.append(createAgcToggle('tunerAgc', 'Tuner AGC'), createAgcToggle('digitalAgc', 'Digital AGC'));
+        agcRow.append(createAgcToggle('tunerAgc', 'Tuner AGC'));
         card.append(head, rangeSelect, customRange, ppmRow, agcRow);
         list.appendChild(card);
       });
@@ -3752,8 +3796,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       const atLimit = clients.length >= 6;
       const form = document.getElementById('rtlClientForm');
       if (form) {
-        form.querySelectorAll('input, button').forEach(input => { input.disabled = atLimit; });
-        form.title = atLimit ? 'The AD600 has six antenna slots' : '';
+        form.querySelectorAll('input, button, select').forEach(input => { input.disabled = atLimit; });
+        form.title = atLimit ? 'Maximum of six receivers' : '';
       }
     }
 
@@ -3789,18 +3833,32 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       toggle.disabled = false;
     }
 
+    function updateSoapyMode() {
+      const remote = document.getElementById('soapyMode').value === 'remote';
+      for (const id of ['rtlClientHost', 'rtlClientPort', 'soapySshUser']) document.getElementById(id).hidden = !remote;
+      document.getElementById('rtlClientHost').required = remote;
+      document.getElementById('soapyModeHint').textContent = remote
+        ? 'Remote SSH: install soapy_power, the RTL-SDR driver and Python 3 on the receiver host. Set up SSH keys and verify its host key first. Only spectra cross the network.'
+        : 'Local USB: install soapy_power and the SoapySDR RTL-SDR driver on this computer. Leave serial blank for one dongle.';
+    }
+
     async function addRtlClient(event) {
       event.preventDefault();
       const payload = {
         action: 'add',
         name: document.getElementById('rtlClientName').value,
+        mode: document.getElementById('soapyMode').value,
+        serial: document.getElementById('soapySerial').value,
+        sshUser: document.getElementById('soapySshUser').value,
         host: document.getElementById('rtlClientHost').value,
         port: document.getElementById('rtlClientPort').value
       };
       if (await postRtlClientAction(payload)) {
         document.getElementById('rtlClientName').value = 'RTL-SDR';
         document.getElementById('rtlClientHost').value = '';
-        document.getElementById('rtlClientPort').value = '1234';
+        document.getElementById('rtlClientPort').value = '22';
+        document.getElementById('soapySerial').value = '';
+        document.getElementById('soapySshUser').value = '';
       }
     }
 
@@ -3994,8 +4052,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
               const startMhz = clientGrid.startHz / 1e6;
               const stopMhz = clientGrid.stopHz / 1e6;
               const seriesLabel = client.name || 'RTL-SDR';
-              const endpoint = client.host.includes(':') ? '[' + client.host + ']' : client.host;
-              const traceLabel = (client.slot || '') + ' · ' + seriesLabel + ' (' + endpoint + ':' + client.port + ') — ' +
+              const endpoint = client.mode === 'local' ? 'Local USB' : 'SSH ' + client.host + ':' + client.port;
+              const traceLabel = (client.slot || '') + ' · ' + seriesLabel + ' (' + endpoint + ') — ' +
                 startMhz.toFixed(1) + '–' + stopMhz.toFixed(1) + ' MHz';
 
               const pts = raw.filter(point => point && Number.isFinite(point.x) && Number.isFinite(point.y));
@@ -4155,7 +4213,11 @@ function startWebServer() {
       res.end(JSON.stringify({ success: false, error: 'Cancel calibration before changing scanner controls' }));
       return;
     }
-    if (urlPath === '/api/ppm-calibration' && req.method === 'POST') return handleCalibrationRequest(req, res);
+    if (urlPath === '/api/ppm-calibration' && req.method === 'POST') {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Automatic calibration requires IQ; use manual PPM correction with soapy_power.' }));
+      return;
+    }
     if (urlPath === '/api/status' && req.method === 'GET') {
       const requestUrl = new URL(req.url, 'http://localhost');
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4198,24 +4260,24 @@ function startWebServer() {
               return;
             }
             const name = String(payload.name || '').trim().slice(0, 64);
-            const host = String(payload.host || '').trim();
-            const port = Number.parseInt(payload.port, 10);
-            if (!name || /[\u0000-\u001f\u007f]/.test(name) || !host || /\s/.test(host) || host.length > 253 ||
-                !Number.isInteger(port) || port < 1 || port > 65535) {
+            let endpoint;
+            try {
+              if (!name || /[\u0000-\u001f\u007f]/.test(name)) throw new Error('Enter an antenna name');
+              endpoint = normalizeReceiverProfile(payload);
+            } catch (error) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: false, error: 'Enter a name, host without spaces, and a port from 1 to 65535' }));
+              res.end(JSON.stringify({ success: false, error: error.message }));
               return;
             }
-            if (appState.rtlClients.some(client => client.host.toLowerCase() === host.toLowerCase() && client.port === port)) {
+            if (appState.rtlClients.some(client => receiversConflict(client, endpoint))) {
               res.writeHead(409, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: false, error: 'That rtl_tcp host and port are already in the list' }));
+              res.end(JSON.stringify({ success: false, error: 'Receiver already configured. Use distinct USB serials for multiple dongles on one host.' }));
               return;
             }
             const client = {
               id: `rtl-${crypto.randomUUID()}`,
               name,
-              host,
-              port,
+              ...endpoint,
               startMhz: RTL_SLOT_RANGES[RTL_SLOTS[appState.rtlClients.length] || 'F'][0],
               stopMhz: RTL_SLOT_RANGES[RTL_SLOTS[appState.rtlClients.length] || 'F'][1],
               ppmCorrection: 0,
@@ -4239,7 +4301,7 @@ function startWebServer() {
             const client = appState.rtlClients.find(item => item.id === payload.id);
             if (!client) {
               res.writeHead(404, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: false, error: 'rtl_tcp client not found' }));
+              res.end(JSON.stringify({ success: false, error: 'soapy_power client not found' }));
               return;
             }
             if (payload.action === 'setRange') {
@@ -4279,6 +4341,11 @@ function startWebServer() {
                 }
               }
             } else if (payload.action === 'setAgc') {
+              if (payload.digitalAgc !== undefined) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Only tuner AGC is supported in soapy_power modes' }));
+                return;
+              }
               const agcSettings = {};
               for (const setting of ['tunerAgc', 'digitalAgc']) {
                 if (Object.prototype.hasOwnProperty.call(payload, setting)) {
@@ -4328,12 +4395,9 @@ function startWebServer() {
                 return;
               }
               if (payload.calibrationRevision !== undefined) {
-                const error = calibrationApplyError(client, rtlClientRuntimes.get(client.id), payload.calibrationRevision, ppmCorrection);
-                if (error) {
-                  res.writeHead(409, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ success: false, error }));
-                  return;
-                }
+                res.writeHead(409, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Automatic calibration is unavailable in soapy_power modes' }));
+                return;
               }
               const previousPpmCorrection = normalizePpmCorrection(client.ppmCorrection);
               client.ppmCorrection = ppmCorrection;
@@ -4363,9 +4427,9 @@ function startWebServer() {
               if (client.enabled) {
                 sourceTraces[client.id] = [];
                 nativeSourceTraces[client.id] = emptyNativeTrace();
-                startRtlTcpClient(client);
+                startSoapyClient(client);
               } else {
-                stopRtlTcpClient(client.id);
+                stopSoapyClient(client.id);
                 if (enabledRtlClients().length === 0 && appState.scanState === 'SCANNING') {
                   appState.scanState = 'STOPPED';
                   broadcastBridgeRequest('/sweep/stop');
@@ -4373,7 +4437,7 @@ function startWebServer() {
               }
             } else if (payload.action === 'remove') {
               const clientIndex = appState.rtlClients.indexOf(client);
-              stopRtlTcpClient(client.id);
+              stopSoapyClient(client.id);
               appState.rtlClients = appState.rtlClients.filter(item => item.id !== client.id);
               delete sourceTraces[client.id];
               delete nativeSourceTraces[client.id];
@@ -4412,10 +4476,10 @@ function startWebServer() {
           const client = appState.rtlClients.find(item => item.id === payload.id) || appState.rtlClients[0];
           if (client && payload.action === 'connect') {
             client.enabled = true;
-            startRtlTcpClient(client);
+            startSoapyClient(client);
           } else if (client && payload.action === 'disconnect') {
             client.enabled = false;
-            stopRtlTcpClient(client.id);
+            stopSoapyClient(client.id);
           }
           syncRtlConnectionState();
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -4433,7 +4497,7 @@ function startWebServer() {
           if (payload.action === 'start') {
             if (enabledRtlClients().length === 0) {
               res.writeHead(409, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: false, error: 'Enable at least one rtl_tcp client before starting a scan' }));
+              res.end(JSON.stringify({ success: false, error: 'Enable at least one soapy_power client before starting a scan' }));
               return;
             }
             appState.scanState = 'SCANNING';
@@ -4443,7 +4507,7 @@ function startWebServer() {
               if (existingRuntime) {
                 restartRtlSweep(existingRuntime);
               } else {
-                startRtlTcpClient(client);
+                startSoapyClient(client);
               }
             }
             syncRtlConnectionState();
@@ -4784,7 +4848,7 @@ function startWebServer() {
     console.log('  RTL-SDR Web Spectrum Scanner');
     console.log('===========================================================');
     console.log(`  [+] Web Dashboard : http://localhost:${WEB_PORT}`);
-    console.log('  [+] rtl_tcp nodes : managed from the dashboard');
+    console.log('  [+] soapy_power nodes : managed from the dashboard');
     console.log(`  [+] LAN control   : ${REMOTE_CONTROL ? 'enabled' : 'VIEW-ONLY for other devices (RTL_REMOTE_CONTROL=0)'}`);
     console.log(`  [+] Chart library : ${fs.existsSync(CHART_JS_LOCAL) ? 'local (offline-capable)' : 'CDN (needs internet - see README)'}`);
     console.log('  [+] Engine logs   : server console');
@@ -4794,13 +4858,13 @@ function startWebServer() {
 
 // Start All Services
 loadRtlClientProfiles();
-stopAllRtlTcpClients();
-initAcnSpectrumIngest();
+stopAllSoapyClients();
 startWebServer();
 
 function shutdownScanner() {
-  stopAllRtlTcpClients();
-  process.exit(0);
+  stopAllSoapyClients();
+  Promise.all(Array.from(retiringSoapyProcesses.values())).then(() => process.exit(0));
+  setTimeout(() => process.exit(0), 10000).unref();
 }
 process.once('SIGINT', shutdownScanner);
 process.once('SIGTERM', shutdownScanner);

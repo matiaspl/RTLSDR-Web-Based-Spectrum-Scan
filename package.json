@@ -1,7 +1,7 @@
 {
   "name": "rtl-sdr-web-spectrum-scanner",
   "version": "1.0.0",
-  "description": "Cross-platform rtl_tcp spectrum scanner with a browser-based FFT dashboard",
+  "description": "Local USB and remote SSH soapy_power spectrum scanner with a browser dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

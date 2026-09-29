@@ -53,6 +53,8 @@ if %errorlevel% neq 0 (
 )
 
 echo [OK] Python is ready.
+echo Local USB mode also needs soapy_power and the SoapySDR RTL-SDR driver.
+echo Remote SSH mode needs these packages on the receiver host instead.
 echo.
 
 :: 3. Launch browser in background after 2 seconds
