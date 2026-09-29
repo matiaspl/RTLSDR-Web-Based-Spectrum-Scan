@@ -8,6 +8,19 @@ browser as the sweep progresses.
 The dashboard is designed for several viewers on the same LAN. Only the server needs to reach the
 RTL-SDR node.
 
+## Screenshots
+
+The images show the same live sweep from the connected 900–1000 MHz test receiver. The other saved
+receiver remains disconnected.
+
+Min/max FFT-bin power in each display pixel:
+
+![Live RTL-SDR spectrum using min/max display](Screenshots/rtl-spectrum-minmax.png)
+
+Average FFT-bin power in each display pixel:
+
+![Live RTL-SDR spectrum using average display](Screenshots/rtl-spectrum-average.png)
+
 ## Features
 
 - Continuous sweeps or a single sweep snapshot.
@@ -32,7 +45,7 @@ Requirements: Node.js 16+ and Python 3.8+. The backend uses only the Python stan
 node server.js
 ```
 
-Open [http://localhost:8080](http://localhost:8080), add one or more receivers in the **Antennas**
+Open [http://localhost:8000](http://localhost:8000), add one or more receivers in the **Antennas**
 section, enable them, then start a sweep. The app starts without an `rtl_tcp` connection; receiver
 endpoints are added from the dashboard and saved on the server.
 
@@ -144,7 +157,7 @@ tuner model with a different tuning range.
 
 ## Network Access
 
-The dashboard listens on TCP port `8080`. Other devices can open `http://<server-ip>:8080` when
+The dashboard listens on TCP port `8000`. Other devices can open `http://<server-ip>:8000` when
 they share a network with the server. The server connects outward to the configured rtl_tcp host
 and port; no incoming RTL-SDR connection to the dashboard computer is required.
 
